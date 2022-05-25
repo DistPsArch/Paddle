@@ -48,7 +48,7 @@ ExternalProject_Add(
     ${EXTERNAL_PROJECT_LOG_ARGS}
     PREFIX                ${PSLIB_PREFIX_DIR}
     DOWNLOAD_DIR          ${PSLIB_DOWNLOAD_DIR}
-    DOWNLOAD_COMMAND      wget --no-check-certificate ${PSLIB_URL} -c -q -O ${PSLIB_NAME}.tar.gz
+    DOWNLOAD_COMMAND      cp /xionglei/paddle/pslib/pslib.tar.gz ./ 
                           && tar zxvf ${PSLIB_NAME}.tar.gz
     DOWNLOAD_NO_PROGRESS  1
     UPDATE_COMMAND        ""
@@ -62,3 +62,7 @@ ExternalProject_Add(
 ADD_LIBRARY(pslib SHARED IMPORTED GLOBAL)
 SET_PROPERTY(TARGET pslib PROPERTY IMPORTED_LOCATION ${PSLIB_LIB})
 ADD_DEPENDENCIES(pslib ${PSLIB_PROJECT})
+
+ADD_LIBRARY(jvm SHARED IMPORTED GLOBAL)
+SET_PROPERTY(TARGET jvm PROPERTY IMPORTED_LOCATION  ${PSLIB_LIB_DIR}/libjvm.so)
+ADD_DEPENDENCIES(jvm ${PSLIB_PROJECT})
