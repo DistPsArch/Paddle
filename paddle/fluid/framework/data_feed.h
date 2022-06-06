@@ -745,15 +745,14 @@ class DLManager {
       return it->second.parser;
     }
     // load so symbol
-    const std::vector<std::string> packages {"/opt/_internal/cpython-3.7.0/lib/python3.7/site-packages/paddle/libs/libps.so"
-        , "/opt/_internal/cpython-3.7.0/lib/python3.7/site-packages/paddle/fluid/core_avx.so"};
+    // 导出libps、core_avx符号给parser共享
+    const std::vector<std::string> packages {"libps.so", "core_avx.so"};
     for (auto& package : packages) {
       if (handle_map_.count(package) == 0) {
         DLHandle handle_ps;
         handle_ps.module = dlopen(package.c_str(), RTLD_NOW | RTLD_GLOBAL);
         if (handle_ps.module == nullptr) {
           VLOG(0) << "Create so of " << package << " fail, " << dlerror();
-          return nullptr;
         }
         handle_map_.insert({package, handle_ps});
       }
