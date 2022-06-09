@@ -1773,5 +1773,239 @@ void SlotRecordDataset::DynamicAdjustReadersNum(int thread_num) {
   PrepareTrain();
 }
 
+void SlotRecordDataset::MergeByInsId() {
+  VLOG(0) << "MultiSlotDataset::MergeByInsId begin";
+  if (!merge_by_insid_) {
+    VLOG(0) << "merge_by_insid=false, will not MergeByInsId";
+    return;
+  }
+
+  auto multi_slot_desc = data_feed_desc_.multi_slot_desc();
+  std::vector<bool> uint64_slots_is_dense;
+  std::vector<bool> float_slots_is_dense;
+  for (int i = 0; i < multi_slot_desc.slots_size(); ++i) {
+    const auto& slot = multi_slot_desc.slots(i);
+    if (slot.is_used()) {
+      // record float value and uint64_t value pos
+      if (slot.type()[0] == 'u') {
+        uint64_slots_is_dense.push_back(slot.is_dense());
+      } else if (slot.type()[0] == 'f') {
+        float_slots_is_dense.push_back(slot.is_dense());
+      }
+    }
+  }
+
+  std::vector<SlotRecord> all_recs;
+  if (input_records_.size() == 0 && input_channel_ != nullptr &&
+        input_channel_->Size() != 0) {
+    input_channel_->ReadAll(all_recs);
+  } else {
+    return;
+  }
+  VLOG(0) << "all_recs.size() " << all_recs.size();
+  std::sort(all_recs.begin(), all_recs.end(), [](const SlotRecord& a, const SlotRecord& b) {
+    return a->ins_id_ < b->ins_id_;
+  });
+
+  int32_t thread_num = 50;
+  int32_t avg_num = all_recs.size() / thread_num;
+  if (all_recs.size() % thread_num != 0) {
+    avg_num++;
+  }
+  std::vector<std::vector<SlotRecord>> recs_vec;
+  recs_vec.resize(thread_num);
+  int recs_vec_index = 0;
+  int recs_vec_num = 0;
+  for (size_t i = 0; i < all_recs.size(); ++i) {
+    if (recs_vec_num < avg_num || (recs_vec_num >= avg_num && all_recs[i - 1]->ins_id_ == all_recs[i]->ins_id_)) {
+      recs_vec[recs_vec_index].push_back(all_recs[i]);
+      ++recs_vec_num;
+    } else if (recs_vec_num >= avg_num && all_recs[i - 1]->ins_id_ != all_recs[i]->ins_id_){
+      recs_vec[++recs_vec_index].push_back(all_recs[i]);
+      recs_vec_num = 0;
+    }
+  }
+
+  std::vector<std::vector<SlotRecord>> results_vec;
+  results_vec.resize(thread_num);
+  std::vector<std::vector<SlotRecord>> del_slotrecord_vec;
+  del_slotrecord_vec.resize(thread_num);
+
+  auto merge_master_patch = [this, &recs_vec, &results_vec, &del_slotrecord_vec, &uint64_slots_is_dense, &float_slots_is_dense](int recs_index) {
+
+    std::vector<SlotRecord>& recs = recs_vec[recs_index];
+    std::vector<SlotRecord>& results = results_vec[recs_index];
+    std::vector<SlotRecord>& del_slotrecord = del_slotrecord_vec[recs_index];
+    SlotRecord master_rec;
+    SlotRecord patch_rec;
+    bool has_conflict_slot = false;
+
+    for (size_t i = 0; i < recs.size();) {
+      master_rec = recs[i];
+      size_t j = i + 1;
+      while (j < recs.size() && recs[j]->ins_id_ == recs[i]->ins_id_) {
+        del_slotrecord.push_back(recs[j]);
+        j++;
+      }
+      if (merge_size_ > 0 && j - i != merge_size_) {
+        // LOG(NOTICE) << "drop ins " << recs[i]->ins_id_ << " size=" << j - i
+        //              << ", because merge_size=" << merge_size_;
+        del_slotrecord.push_back(recs[i]);
+        i = j;
+        continue;
+      }
+      has_conflict_slot = false;
+      for (size_t k = i + 1; k < j; k++) {
+        patch_rec = recs[k];
+        CHECK(master_rec->slot_uint64_feasigns_.slot_offsets.size() == patch_rec->slot_uint64_feasigns_.slot_offsets.size()) << "master_rec size:" 
+                << master_rec->slot_uint64_feasigns_.slot_offsets.size() << "patch_rec size:" << patch_rec->slot_uint64_feasigns_.slot_offsets.size();
+        for (size_t index = 0; index < master_rec->slot_uint64_feasigns_.slot_offsets.size() - 1; ++index) {
+          size_t master_begin_index = master_rec->slot_uint64_feasigns_.slot_offsets[index];
+          size_t master_end_index = master_rec->slot_uint64_feasigns_.slot_offsets[index + 1];
+          size_t patch_begin_index = patch_rec->slot_uint64_feasigns_.slot_offsets[index];
+          size_t patch_end_index = patch_rec->slot_uint64_feasigns_.slot_offsets[index + 1];
+          if (uint64_slots_is_dense[index]) {
+            bool dense_empty = true;
+            size_t size = 0;
+            auto value = master_rec->slot_uint64_feasigns_.get_values(index, &size);
+            for (size_t i = 0; i < size; ++i) {
+              if (value[i] != 0) {
+                dense_empty = false;
+              }
+            }
+            if (dense_empty) {
+              master_rec->slot_uint64_feasigns_.erase(index, master_begin_index, master_end_index);
+              master_rec->slot_uint64_feasigns_.insert(patch_rec->slot_uint64_feasigns_.slot_values, index, patch_begin_index, patch_end_index);
+            }
+          } else {
+            size_t size = 0;
+            auto value = master_rec->slot_uint64_feasigns_.get_values(index, &size);
+            int offset = 0;
+            for (size_t i = 0; i < size; ++i) {
+              if (value[i] == 0) {
+                master_rec->slot_uint64_feasigns_.erase(index, master_begin_index + offset, master_begin_index + offset + 1);
+              } else {
+                offset++;
+              }
+            }
+            master_rec->slot_uint64_feasigns_.get_values(index, &size);
+
+            bool dense_empty = true;
+            size_t patch_size = 0;
+            value = patch_rec->slot_uint64_feasigns_.get_values(index, &patch_size);
+            for (size_t i = 0; i < patch_size; ++i) {
+              if (value[i] != 0) {
+                dense_empty = false;
+              }
+            }
+            if (size != 0 && !dense_empty) {
+              del_slotrecord.push_back(master_rec);
+              has_conflict_slot = true;
+              break;
+            } else if (size == 0 && !dense_empty) {  //if (size == 0 && patch_end_index - patch_begin_index != 0)
+              master_rec->slot_uint64_feasigns_.insert(patch_rec->slot_uint64_feasigns_.slot_values, index, patch_begin_index, patch_end_index);
+            }
+          }
+        }
+
+        if (has_conflict_slot) {
+          break;
+        }
+
+        CHECK(master_rec->slot_float_feasigns_.slot_offsets.size() == patch_rec->slot_float_feasigns_.slot_offsets.size()) << "master_rec size:" 
+                  << master_rec->slot_float_feasigns_.slot_offsets.size() << "patch_rec size:" << patch_rec->slot_float_feasigns_.slot_offsets.size();
+        for (size_t index = 0; index < master_rec->slot_float_feasigns_.slot_offsets.size() - 1; ++index) {
+          size_t master_begin_index = master_rec->slot_float_feasigns_.slot_offsets[index];
+          size_t master_end_index = master_rec->slot_float_feasigns_.slot_offsets[index + 1];
+          size_t patch_begin_index = patch_rec->slot_float_feasigns_.slot_offsets[index];
+          size_t patch_end_index = patch_rec->slot_float_feasigns_.slot_offsets[index + 1];
+          if (float_slots_is_dense[index]) {
+            bool dense_empty = true;
+            size_t size = 0;
+            auto value = master_rec->slot_float_feasigns_.get_values(index, &size);
+            for (size_t i = 0; i < size; ++i) {
+              if (fabs(value[i]) >= 1e-6) {
+                dense_empty = false;
+              }
+            }
+            if (dense_empty) {
+              master_rec->slot_float_feasigns_.erase(index, master_begin_index, master_end_index);
+              master_rec->slot_float_feasigns_.insert(patch_rec->slot_float_feasigns_.slot_values, index, patch_begin_index, patch_end_index);
+            }
+          } else {
+            size_t size = 0;
+            auto value = master_rec->slot_float_feasigns_.get_values(index, &size);
+            int offset = 0;
+            for (size_t i = 0; i < size; ++i) {
+              if (value[i] == 0) {
+                master_rec->slot_float_feasigns_.erase(index, master_begin_index + offset, master_begin_index + offset + 1);
+              } else {
+                offset++;
+              }
+            }
+            master_rec->slot_float_feasigns_.get_values(index, &size);
+
+            bool dense_empty = true;
+            size_t patch_size = 0;
+            value = patch_rec->slot_float_feasigns_.get_values(index, &patch_size);
+            for (size_t i = 0; i < patch_size; ++i) {
+              if (value[i] != 0) {
+                dense_empty = false;
+              }
+            }
+            if (size != 0 && !dense_empty) {
+              del_slotrecord.push_back(master_rec);
+              has_conflict_slot = true;
+              break;
+            } else if (size == 0 && !dense_empty) {  //if (size == 0 && patch_end_index - patch_begin_index != 0)
+              master_rec->slot_float_feasigns_.insert(patch_rec->slot_float_feasigns_.slot_values, index, patch_begin_index, patch_end_index);
+            }
+          }
+        }
+
+        if (has_conflict_slot) {
+          break;
+        }
+      }
+
+      if (!has_conflict_slot) {
+        results.emplace_back(master_rec);
+      }
+      i = j;
+    }
+  };
+
+  std::vector<std::thread> threads;
+  threads.resize(thread_num);
+  for (size_t i = 0; i < threads; i++) {
+      threads[i] = std::thread(merge_master_patch, i);
+  }
+  for (size_t i = 0; i < threads; i++) {
+      threads[i].join();
+  }
+
+  std::vector<SlotRecord>().swap(all_recs);
+  std::vector<SlotRecord> results;
+  for (auto& res : results_vec) {
+    results.insert(results.end(), res.begin(), res.end());
+  }
+  std::vector<SlotRecord> del_slotrecord;
+  for (auto& dsr : del_slotrecord_vec) {
+    del_slotrecord.insert(del_slotrecord.end(), dsr.begin(), dsr.end());
+  }
+  VLOG(0) << "results size " << results.size();
+  VLOG(0) << "total drop ins num: " << del_slotrecord.size();
+  SlotRecordPool().put(&del_slotrecord);
+
+  auto fleet_ptr = framework::FleetWrapper::GetInstance();
+  std::shuffle(results.begin(), results.end(), fleet_ptr->LocalRandomEngine());
+  // std::shuffle(results.begin(), results.end(), LocalRandomEngine()); //fleet_ptr->LocalRandomEngine());
+  input_channel_->Open();
+  input_channel_->Write(std::move(results));
+  input_channel_->Close();
+  VLOG(3) << "MultiSlotDataset::MergeByInsId end";
+}
+
+
 }  // end namespace framework
 }  // end namespace paddle
