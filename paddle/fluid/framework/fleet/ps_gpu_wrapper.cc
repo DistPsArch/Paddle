@@ -786,6 +786,7 @@ void PSGPUWrapper::LoadIntoMemory(bool is_shuffle) {
   if (is_shuffle) {
     dataset_->LocalShuffle();
   }
+  dataset_->MergeByInsId();
 
   std::shared_ptr<HeterContext> gpu_task = gpu_task_pool_.Get();
   gpu_task->Reset();

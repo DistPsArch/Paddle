@@ -125,6 +125,23 @@ struct SlotValues {
       slot_offsets.shrink_to_fit();
     }
   }
+  // [begin_index, end_index)
+  void insert(std::vector<T>& slot_feasigns, size_t idx, size_t begin_index, size_t end_index) {
+    size_t size = end_index - begin_index;
+    slot_values.insert(slot_values.begin() + slot_offsets[idx + 1], 
+                        slot_feasigns.begin() + begin_index, slot_feasigns.begin() + end_index);
+    for (size_t i = idx + 1; i < slot_offsets.size() ;++i) {
+      slot_offsets[i] = slot_offsets[i] + size;
+    }
+  }
+  // [begin_index, end_index)
+  void erase(size_t idx, size_t begin_index, size_t end_index) {
+    size_t size = end_index - begin_index;
+    slot_values.erase(slot_values.begin() + begin_index, slot_values.begin() + end_index);
+    for (size_t i = idx + 1; i < slot_offsets.size() ;++i) {
+      slot_offsets[i] = slot_offsets[i] - size;
+    }
+  }
 };
 union FeatureFeasign {
   uint64_t uint64_feasign_;
