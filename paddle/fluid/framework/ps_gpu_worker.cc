@@ -34,6 +34,42 @@ limitations under the License. */
 namespace paddle {
 namespace framework {
 
+std::atomic<int> PSGPUWorker::shape_check_count_(16);
+std::atomic<bool> PSGPUWorker::shape_check_flag_(false);
+
+void PSGPUWorker::CreateDeviceResource(const ProgramDesc& main_prog) {
+  this->HogwildWorker::CreateDeviceResource(main_prog);
+  if (scope_num_ != 1) {
+    auto& block = main_prog.Block(0);
+    for (int i = 0; i < scope_num_; i++) {
+      auto thread_tmp = &thread_scope_->NewScope();
+      thread_scope_vec_.push_back(thread_tmp);
+    }
+    for (auto& scope : thread_scope_vec_) {
+      for (auto& var : block.AllVars()) {
+        std::string name = var->Name();
+        if (!var->Persistable()) {
+          auto* ptr = scope->Var(var->Name());
+          InitializeVariable(ptr, var->GetType());
+        }
+      }
+    }
+    for (auto& op : ops_) {
+      op->SetIsRuntimeInferShape(true);
+    }
+  }
+}
+
+void PSGPUWorker::BindingDataFeedMemory() {
+  if (scope_num_ == 1) {
+    this->HogwildWorker::BindingDataFeedMemory();
+  } else {
+    for (auto& scope : thread_scope_vec_) {
+      device_reader_->AssignFeedVar(*scope);
+    }
+  }
+}
+
 void PSGPUWorker::Initialize(const TrainerDesc& desc) {
   param_ = desc.downpour_param();
   dev_ctx_ = platform::DeviceContextPool::Instance().Get(place_);
@@ -163,28 +199,29 @@ void PSGPUWorker::PrepareCudaGraph() {
     }
     if (!need_skip) {
       bool need_capture = false;
-      if (op_blacklist.find(op->Type()) == op_blacklist.end()) {
-        if (op->HasAttr(enable_cuda_graph_capture_attr_name) && op->Attr<int>(enable_cuda_graph_capture_attr_name)) {
-          need_capture = true;
-        }
-        if (!need_capture) {
-          need_capture = true;
-          for (auto& input : op->InputVars()) {
-            if (var_whitelist.find(input) == var_whitelist.end()) {
-              need_capture = false;
-              break;
-            }
-          }
-          if (need_capture) {
-            for (auto& output : op->OutputVars(true)) {
-              if (var_whitelist.find(output) == var_whitelist.end()) {
-                need_capture = false;
-                break;
-              }
-            }
-          }
-        }
-      }
+      // if (op_blacklist.find(op->Type()) == op_blacklist.end()) {
+      //   if (op->HasAttr(enable_cuda_graph_capture_attr_name) && op->Attr<int>(enable_cuda_graph_capture_attr_name)) {
+      //     need_capture = true;
+      //   }
+      //   if (!need_capture) {
+      //     need_capture = true;
+      //     for (auto& input : op->InputVars()) {
+      //       if (var_whitelist.find(input) == var_whitelist.end()) {
+      //         need_capture = false;
+      //         break;
+      //       }
+      //     }
+      //     if (need_capture) {
+      //       for (auto& output : op->OutputVars(true)) {
+      //         if (var_whitelist.find(output) == var_whitelist.end()) {
+      //           need_capture = false;
+      //           break;
+      //         }
+      //       }
+      //     }
+      //   }
+      // }
+
       if (op_or_cudagraphs_.empty() || op_or_cudagraphs_.back().need_capture != need_capture) {
         op_or_cudagraphs_.emplace_back();
         op_or_cudagraphs_.back().need_capture = need_capture;
@@ -203,8 +240,89 @@ void PSGPUWorker::PrepareCudaGraph() {
   }
 }
 
+PSGPUWorker::~PSGPUWorker() {
+  stop_token_.store(true);
+  for (auto& thread : task_threads_) {
+    if (thread.joinable()) {
+        thread.join();
+    }
+  }
+}
+
+int PSGPUWorker::OpRunAndShapeCheck(OperatorBase& op,
+                                    const Scope& scope,
+                                    const platform::Place& place) {
+    if (shape_check_flag_.load()) {
+      VLOG(0) << "Begin OpRunAndShapeCheck... "
+            << shape_check_count_.load();
+      if (shape_check_count_.fetch_sub(1) <= 0) {
+        // shape_check_flag_ = false;
+      }
+      // before op run
+      InferShapeCheckData check_data;
+      auto& pre_dims = check_data.pre_dims;
+      auto& pre_lods = check_data.pre_lods;
+      auto& after_dims = check_data.after_dims;
+      auto& after_lods = check_data.after_lods;
+      RuntimeContext ctx(op.Inputs(), op.Outputs(), scope);
+      RuntimeInferShapeContext infer_shape_ctx(op, ctx);
+      auto outnames = op.Outputs();
+      for (auto& var_name_item : outnames) {
+        pre_dims.push_back(infer_shape_ctx.GetOutputsDim(var_name_item.first));
+        pre_lods.push_back(infer_shape_ctx.GetOutputsLod(var_name_item.first));
+      }
+
+      // op run
+      op.Run(scope, place);
+
+      // after op run
+      for (auto& var_name_item : outnames) {
+        after_dims.push_back(infer_shape_ctx.GetOutputsDim(var_name_item.first));
+        after_lods.push_back(infer_shape_ctx.GetOutputsLod(var_name_item.first));
+      }
+      // auto& op_name = op.Info().Proto().type();
+      CHECK(pre_dims.size() == after_dims.size())
+                << "dims error, op name:" << op.Info().Proto().type();
+      for (size_t i = 0; i < pre_dims.size(); i++) {
+        CHECK(pre_dims[i].size() == after_dims[i].size())
+                  << "dims error, op name:" << op.Info().Proto().type();
+        for (size_t j = 0; j < pre_dims[i].size(); j++) {
+          CHECK(pre_dims[i][j] == after_dims[i][j])
+                    << "dims error, op name:" << op.Info().Proto().type();
+        }
+      }
+
+      CHECK(pre_lods.size() == after_lods.size())
+        << "lods error, op name:" << op.Info().Proto().type();
+      for (size_t i = 0; i < pre_lods.size(); i++) {
+        CHECK(pre_lods[i].size() == after_lods[i].size())
+          << "lods error, op name:" << op.Info().Proto().type();
+        for (size_t j = 0; j < pre_lods[i].size(); j++) {
+          auto& x = pre_lods[i][j];
+          auto& y = after_lods[i][j];
+          CHECK(x.size() == y.size())
+              << "lods error, op name:" << op.Info().Proto().type();
+          for (size_t i = 0; i < x.size(); i++) {
+            const auto &x_level = x[i];
+            const auto &y_level = y[i];
+            CHECK(x_level.size() == y_level.size())
+                << "lods error, op name:" << op.Info().Proto().type();
+            for (size_t j = 0; j < x_level.size(); j++) {
+               CHECK(x_level[j] == y_level[j])
+                  << "lods error, op name:" << op.Info().Proto().type();
+            }
+          }
+        }
+      }
+    } else {
+       op.Run(scope, place);
+    }
+    return 0;
+}
+
+
 void PSGPUWorker::TrainFiles() {
-  VLOG(3) << "Begin to train files";
+  VLOG(0) << "Begin to train files";
   platform::SetNumThreads(1);
   platform::Timer timeline;
   timeline.Start();
@@ -219,7 +337,81 @@ void PSGPUWorker::TrainFiles() {
   int graph_batch_size = 0;
 
   platform::SetDeviceId(place_.GetDeviceId());
-  while ((cur_batch = device_reader_->Next()) > 0) {
+
+  // async infershape
+  pack_is_end_.store(false);
+  if (scope_num_ != 1) {
+    for (size_t i = 0; i < thread_scope_vec_.size(); i++) {
+      TaskData task;
+      task.scope = thread_scope_vec_[i];
+      free_task_queue_.Push(task);
+    }
+    // std::atomic<int>* thread_run = new std::atomic<int>(task_threads_);
+    thread_count_.store(task_threads_num_);
+    task_threads_.reserve(task_threads_num_);
+    for (int i = 0; i < task_threads_num_; i++) {
+      task_threads_.emplace_back(std::thread([this]() -> void {
+        while (true) {
+          auto pack = device_reader_->get_pack(nullptr);
+          if (pack == nullptr) {
+            int thread_num = thread_count_.fetch_sub(1);
+            if (thread_num == 1) {
+              pack_is_end_.store(true);
+            }
+            return;
+          }
+          auto task = free_task_queue_.Pop();
+          task.pack = pack;
+          task.ins_num = pack->ins_num();
+          device_reader_->PackToScope(task.pack, task.scope);
+          for (size_t ii = 0; ii < ops_.size(); ii++) {
+            auto& op = ops_[ii];
+            bool need_skip = false;
+            for (auto t = 0u; t < skip_ops_.size(); ++t) {
+              if (op->Type().find(skip_ops_[t]) != std::string::npos) {
+                need_skip = true;
+                break;
+              }
+            }
+            if (!need_skip) {
+              op->RuntimeInferShape(*task.scope);
+            }
+          }
+          using_task_queue_.Push(task);
+        }
+      }));
+    }
+  }
+
+  while (true) {
+    auto thread_scope = thread_scope_;
+    TaskData cur_task;
+    if (scope_num_ == 1) {
+      cur_batch = device_reader_->Next();
+    } else {
+      while (true) {
+        if (using_task_queue_.Size() != 0) {
+          cur_task = using_task_queue_.Pop();
+          cur_batch = cur_task.ins_num;
+          break;
+        }
+        bool is_end = pack_is_end_.load();
+        if (is_end) {
+          if (using_task_queue_.Size() == 0) {
+            cur_batch = 0;
+            break;
+          }
+        }
+        std::this_thread::sleep_for(
+          std::chrono::microseconds(200));
+      }
+      thread_scope = cur_task.scope;
+    }
+
+    if (cur_batch <= 0) {
+      break;
+    }
+
     total_ins_num += cur_batch;
 
     if (op_or_cudagraphs_.empty()) {
@@ -233,7 +425,8 @@ void PSGPUWorker::TrainFiles() {
           }
         }
         if (!need_skip) {
-          op->Run(*thread_scope_, place_);
+          OpRunAndShapeCheck(*op, *thread_scope, place_);
+          // op->Run(*thread_scope, place_);
         }
       }
       graph_batch_size = cur_batch;
@@ -249,7 +442,8 @@ void PSGPUWorker::TrainFiles() {
           }
         }
         if (!need_skip) {
-          op->Run(*thread_scope_, place_);
+          OpRunAndShapeCheck(*op, *thread_scope, place_);
+          // op->Run(*thread_scope, place_);
         }
       }
     } else {
@@ -261,7 +455,8 @@ void PSGPUWorker::TrainFiles() {
             std::lock_guard<std::mutex> lock(_capture_mutex);
             platform::BeginCUDAGraphCapture(place_, cudaStreamCaptureModeThreadLocal);
             for (auto& op : op_or_cuda_graph.ops) {
-              op->Run(*thread_scope_, place_);
+              OpRunAndShapeCheck(*op, *thread_scope, place_);
+              // op->Run(*thread_scope, place_);
             }
             op_or_cuda_graph.cudagraph = platform::EndCUDAGraphCapture();
           }
@@ -271,20 +466,21 @@ void PSGPUWorker::TrainFiles() {
           op_or_cuda_graph.cudagraph->Replay();
         } else {
           for (auto& op : op_or_cuda_graph.ops) {
-            op->Run(*thread_scope_, place_);
+            OpRunAndShapeCheck(*op, *thread_scope, place_);
+            // op->Run(*thread_scope, place_);
           }
         }
       }
     }
     if (need_dump_field_) {
-      DumpField(*thread_scope_, dump_mode_, dump_interval_);
+      DumpField(*thread_scope, dump_mode_, dump_interval_);
     }
     if (need_dump_param_ && thread_id_ == 0) {
-      DumpParam(*thread_scope_, batch_cnt);
+      DumpParam(*thread_scope, batch_cnt);
     }
 
     for (std::string& var_name : check_nan_var_names_) {
-      Variable* var = thread_scope_->FindVar(var_name);
+      Variable* var = thread_scope->FindVar(var_name);
       if (var == nullptr) {
         continue;
       }
@@ -299,11 +495,11 @@ void PSGPUWorker::TrainFiles() {
           std::lock_guard<std::mutex> lock(mutex);
           VLOG(0) << "worker " << thread_id_ << ": " << var_name
                   << " cantains inf or nan";
-          auto all_vars = thread_scope_->LocalVarNames();
+          auto all_vars = thread_scope->LocalVarNames();
           std::stringstream ss;
           ss << "====== worker " << thread_id_ << "======\n";
           for (auto& local_var : all_vars) {
-            platform::PrintVar(thread_scope_, local_var, local_var, &ss);
+            platform::PrintVar(thread_scope, local_var, local_var, &ss);
             ss << "\n";
           }
           std::cout << ss.str() << std::endl;
@@ -316,8 +512,13 @@ void PSGPUWorker::TrainFiles() {
 
     dev_ctx_->Wait();
     PrintFetchVars();
-    thread_scope_->DropKids();
+    thread_scope->DropKids();
     ++batch_cnt;
+
+    if (scope_num_ != 1) {
+      device_reader_->get_pack(cur_task.pack);
+      free_task_queue_.Push(cur_task);
+    }
   }
   if (need_dump_field_ || need_dump_param_) {
     writer_.Flush();
@@ -330,7 +531,7 @@ void PSGPUWorker::TrainFiles() {
 
 void PSGPUWorker::TrainFilesWithProfiler() {
   platform::SetNumThreads(1);
-  VLOG(3) << "Begin to train files with profiler";
+  VLOG(0) << "Begin to train files with profiler";
   device_reader_->Start();
   std::vector<double> op_total_time;
   std::vector<std::string> op_name;

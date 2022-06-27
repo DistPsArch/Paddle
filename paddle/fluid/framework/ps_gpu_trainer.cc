@@ -280,12 +280,13 @@ void PSGPUTrainer::InitTrainerEnv(const ProgramDesc& main_program,
       if (var->Persistable()) {
         auto name = var->Name();
         Variable* root_var = root_scope_->FindVar(name);
+
+        auto* ptr = scope->Var(name);
+        InitializeVariable(ptr, proto::VarType::LOD_TENSOR);
         if (!root_var) {
           continue;
         }
         LoDTensor* root_tensor = root_var->GetMutable<LoDTensor>();
-        auto* ptr = scope->Var(name);
-        InitializeVariable(ptr, proto::VarType::LOD_TENSOR);
         LoDTensor* thread_tensor = ptr->GetMutable<LoDTensor>();
         TensorCopy(*root_tensor, place, thread_tensor);
       }
@@ -301,6 +302,19 @@ void PSGPUTrainer::InitTrainerEnv(const ProgramDesc& main_program,
       }
     }
   }
+
+  for (size_t num = 0; num < places_.size(); ++num) {
+    Scope* scope = workers_[num]->GetThreadScope();
+    for (size_t i = 0; i < need_merge_var_names_.size(); i++) {
+      Variable* thread_var = scope->FindVar(need_merge_var_names_[i]);
+      if (thread_var != nullptr) {
+        continue;
+      }
+      auto* ptr = scope->Var(need_merge_var_names_[i]);
+      InitializeVariable(ptr, proto::VarType::LOD_TENSOR);
+    }
+  }
+
   place_ = place;
   return;
 }

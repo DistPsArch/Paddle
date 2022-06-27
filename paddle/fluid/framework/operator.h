@@ -31,6 +31,7 @@ limitations under the License. */
 #include "paddle/fluid/framework/op_info.h"
 #include "paddle/fluid/framework/op_kernel_type.h"
 #include "paddle/fluid/framework/phi_utils.h"
+#include "paddle/fluid/framework/shape_inference.h"
 #include "paddle/fluid/framework/scope.h"
 #include "paddle/fluid/framework/selected_rows_utils.h"
 #include "paddle/fluid/framework/tensor.h"
@@ -217,6 +218,9 @@ class OperatorBase {
   virtual std::vector<std::string> OutputVars(bool has_intermediate) const;
 
   void SetIsCalledByExecutor(bool x) { run_by_executor_ = x; }
+
+  virtual void SetIsRuntimeInferShape(bool x) {}
+  virtual void RuntimeInferShape(const Scope& scope) const {}
 
   virtual void RuntimeInferShape(const Scope& scope,
                                  const platform::Place& place,
@@ -579,8 +583,14 @@ class OperatorWithKernel : public OperatorBase {
 
   virtual void InferShape(InferShapeContext* ctx) const;
 
+  void SetIsRuntimeInferShape(bool x) override {
+    all_kernels_must_compute_runtime_shape_ = x;
+  }
+
   void RuntimeInferShape(const Scope& scope, const platform::Place& place,
                          const RuntimeContext& ctx) const override;
+
+  void RuntimeInferShape(const Scope& scope) const override;
 
   proto::VarType::Type IndicateVarDataType(const ExecutionContext& ctx,
                                            const std::string& name) const;
@@ -701,6 +711,84 @@ class OperatorWithKernel : public OperatorBase {
   mutable bool run_kp_kernel = false;
   mutable std::unique_ptr<phi::KernelSignature> pt_kernel_signature_;
   mutable std::unique_ptr<phi::Kernel> pt_kernel_;
+};
+
+class RuntimeInferShapeContext : public InferShapeContext {
+ public:
+  RuntimeInferShapeContext(const OperatorBase& op, const RuntimeContext& ctx)
+      : op_(op), ctx_(ctx) {}
+
+  bool HasInput(const std::string &name) const override;
+  bool HasOutput(const std::string &name) const override;
+  bool HasAttr(const std::string &name) const override;
+
+  std::vector<proto::VarType::Type> GetInputsVarType(
+      const std::string &name) const override;
+  std::vector<proto::VarType::Type> GetOutputsVarType(
+      const std::string &name) const override;
+
+  bool HasInputs(const std::string &name) const override;
+  bool HasOutputs(const std::string &name) const override;
+
+  DDim GetInputDim(const std::string &name) const override;
+  std::vector<DDim> GetInputsDim(const std::string &name) const override;
+
+  void SetOutputDim(const std::string &name, const DDim &dim) override;
+  void SetOutputsDim(const std::string &name,
+                             const std::vector<DDim> &dims) override;
+  std::string GetInputNameByIdx(size_t idx) const override;
+  std::string GetOutputNameByIdx(size_t idx) const override;
+  AttrReader Attrs() const override;
+  std::vector<std::string> Inputs(const std::string &name) const override;
+  std::vector<std::string> Outputs(const std::string &name) const override;
+
+  void ShareDim(const std::string &in, const std::string &out,
+                        size_t i = 0, size_t j = 0) override;
+
+  void ShareLoD(const std::string &in, const std::string &out,
+                        size_t i = 0, size_t j = 0) const override;
+
+  void ShareAllLoD(const std::string &in,
+                           const std::string &out) const override;
+
+  int32_t GetLoDLevel(const std::string &in, size_t i = 0) const override;
+
+  void SetLoDLevel(const std::string &out, int32_t lod_level,
+                           size_t j = 0) const override;
+
+  bool IsRuntime() const override;
+
+  bool IsRunMKLDNNKernel() const override;
+
+  std::vector<InferShapeVarPtr> GetInputVarPtrs(
+      const std::string &name) const override;
+  std::vector<InferShapeVarPtr> GetOutputVarPtrs(
+      const std::string &name) const override;
+
+  std::vector<LoD> GetOutputsLod(const std::string& out) const;
+
+  std::vector<DDim> GetOutputsDim(const std::string& name) const;
+
+
+protected:
+  std::vector<DDim> GetRepeatedDims(const std::string &name) const override;
+  void SetRepeatedDims(const std::string &name,
+                               const std::vector<DDim> &dims) override;
+
+  DDim GetDim(Variable* var) const;
+  std::vector<DDim> GetDims(const std::vector<Variable*>& vars) const;
+  void SetDim(Variable* var, const DDim& dim);
+  void SetDims(const std::vector<Variable*>& vars,
+               const std::vector<DDim>& dims);
+
+  proto::VarType::Type GetVarType(Variable* var) const;
+  std::vector<proto::VarType::Type> GetVarTypes(
+      const std::vector<Variable*>& vars) const;
+private:
+  const std::vector<Variable*>& InputVars(const std::string& name) const;
+  const std::vector<Variable*>& OutputVars(const std::string& name) const;
+  const OperatorBase& op_;
+  const RuntimeContext& ctx_;
 };
 
 extern bool OpSupportGPU(const std::string& op_type);

@@ -47,6 +47,7 @@ class PullBoxSparseOp : public framework::OperatorWithKernel {
       outs_dims[i] = phi::make_ddim(out_dim);
     }
     ctx->SetOutputsDim("Out", outs_dims);
+    ctx->ShareAllLoD("Ids", "Out");
     for (size_t i = 0; i < n_ids; ++i) {
       ctx->ShareLoD("Ids", "Out", i, i);
     }

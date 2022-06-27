@@ -1955,6 +1955,20 @@ void PaddleBoxDataFeed::PutToFeedVec(const std::vector<Record*>& ins_vec) {
 #endif
 }
 
+SlotRecordInMemoryDataFeed::~SlotRecordInMemoryDataFeed() {
+#if defined(PADDLE_WITH_CUDA) && defined(PADDLE_WITH_HETERPS)
+  stop_token_.store(true);
+  for (auto& thread : pack_threads_) {
+    if (thread.joinable()) {
+        thread.join();
+    }
+  }
+  for (auto* pack : pack_vec_) {
+    pack->set_use_flag(false);
+  }
+#endif
+}
+
 template class InMemoryDataFeed<SlotRecord>;
 void SlotRecordInMemoryDataFeed::Init(const DataFeedDesc& data_feed_desc) {
   finish_init_ = false;
@@ -2110,7 +2124,7 @@ void SlotRecordInMemoryDataFeed::LoadIntoMemoryByFile(void) {
 
   std::string filename;
   while (this->PickOneFile(&filename)) {
-    VLOG(0) << "PickOneFile, filename=" << filename
+    VLOG(3) << "PickOneFile, filename=" << filename
             << ", thread_id=" << thread_id_;
     platform::Timer timeline;
     timeline.Start();
@@ -2130,7 +2144,7 @@ void SlotRecordInMemoryDataFeed::LoadIntoMemoryByFile(void) {
       } else {
         int err_no = 0;
         if (idx == 0) {
-            filename = filename.substr(7);
+          filename = filename.substr(7);
         }
         this->fp_ = fs_open_read(filename, &err_no, this->pipe_command_);
 
@@ -2166,7 +2180,7 @@ void SlotRecordInMemoryDataFeed::LoadIntoMemoryByLine(void) {
   BufferedLineFileReader::LineFunc line_func = nullptr;
 
   while (this->PickOneFile(&filename)) {
-    VLOG(3) << "PickOneFile, filename=" << filename
+    VLOG(0) << "PickOneFile, filename=" << filename
             << ", thread_id=" << thread_id_;
     std::vector<SlotRecord> record_vec;
     platform::Timer timeline;
@@ -2422,8 +2436,13 @@ bool SlotRecordInMemoryDataFeed::ParseOneInstance(const std::string& line,
 
 void SlotRecordInMemoryDataFeed::AssignFeedVar(const Scope& scope) {
   CheckInit();
+  if (scpoe_feed_vec_.count(&scope) > 0) {
+    return;
+  }
+  auto& feed_vec = scpoe_feed_vec_[&scope];
+  feed_vec.resize(used_slots_info_.size());
   for (int i = 0; i < use_slot_size_; ++i) {
-    feed_vec_[i] =
+    feed_vec[i] =
         scope.FindVar(used_slots_info_[i].slot)->GetMutable<LoDTensor>();
   }
 }
@@ -2431,15 +2450,14 @@ void SlotRecordInMemoryDataFeed::AssignFeedVar(const Scope& scope) {
 void SlotRecordInMemoryDataFeed::PutToFeedVec(const SlotRecord* ins_vec,
                                               int num) {
 #if defined(PADDLE_WITH_CUDA) && defined(PADDLE_WITH_HETERPS)
-  paddle::platform::SetDeviceId(place_.GetDeviceId());
-  pack_->pack_instance(ins_vec, num);
-  BuildSlotBatchGPU(pack_->ins_num());
+  // nothing to do
 #else
   for (int j = 0; j < use_slot_size_; ++j) {
     auto& feed = feed_vec_[j];
     if (feed == nullptr) {
       continue;
     }
+
     auto& slot_offset = offset_[j];
     slot_offset.clear();
     slot_offset.reserve(num + 1);
@@ -2589,80 +2607,126 @@ bool SlotRecordInMemoryDataFeed::Start() {
   this->finish_start_ = true;
 #if defined(PADDLE_WITH_CUDA) && defined(PADDLE_WITH_HETERPS)
   CHECK(paddle::platform::is_gpu_place(this->place_));
-  pack_ = BatchGpuPackMgr().get(this->GetPlace(), used_slots_info_);
+
+  for (int i = 0; i < pack_thread_num_ + 1; i++) {
+    auto pack = BatchGpuPackMgr().get(this->GetPlace(), used_slots_info_);
+    pack_vec_.push_back(pack);
+    free_pack_queue_.Push(pack);
+  }
+
+  pack_offset_index_.store(0);
+  pack_is_end_.store(false);
+  thread_count_.store(pack_thread_num_);
+  pack_threads_.reserve(pack_thread_num_);
+  for (int i = 0; i < pack_thread_num_; i++) {
+    pack_threads_.emplace_back(std::thread([this]() -> void {
+      while (!stop_token_.load()) {
+        uint64_t offset_index = pack_offset_index_.fetch_add(1);
+        if (offset_index >= batch_offsets_.size()) {
+          int thread_num = thread_count_.fetch_sub(1);
+          if (thread_num == 1) {
+            pack_is_end_.store(true);
+          }
+          return;
+        }
+        auto* pack = free_pack_queue_.Pop();
+
+        auto& batch = batch_offsets_[offset_index];
+        auto offset = batch.first;
+        auto batch_size = batch.second;
+
+        paddle::platform::SetDeviceId(place_.GetDeviceId());
+        pack->pack_instance(&records_[offset], batch_size);
+        this->BuildSlotBatchGPU(batch_size, pack);
+        using_pack_queue_.Push(pack);
+      }
+    }));
+  }
+
+
 #endif
   return true;
 }
 
 int SlotRecordInMemoryDataFeed::Next() {
-#ifdef _LINUX
-  this->CheckStart();
-
-  VLOG(3) << "enable heter next: " << offset_index_
-          << " batch_offsets: " << batch_offsets_.size();
-  if (offset_index_ >= batch_offsets_.size()) {
-    VLOG(3) << "offset_index: " << offset_index_
-            << " batch_offsets: " << batch_offsets_.size();
-    return 0;
+  while (true) {
+    if (last_pack_ != nullptr) {
+      free_pack_queue_.Push(last_pack_);
+      last_pack_ = nullptr;
+    }
+    if (using_pack_queue_.Size() != 0) {
+      auto* pack = using_pack_queue_.Pop();
+      PackToScope(pack);
+      last_pack_ = pack;
+      return pack->ins_num();
+    }
+    bool is_end = pack_is_end_.load();
+    if (is_end) {
+      if (using_pack_queue_.Size() == 0) {
+        return 0;
+      }
+    }
+    std::this_thread::sleep_for(
+          std::chrono::microseconds(200));
   }
-  auto& batch = batch_offsets_[offset_index_++];
-  this->batch_size_ = batch.second;
-  VLOG(3) << "batch_size_=" << this->batch_size_
-          << ", thread_id=" << thread_id_;
-  if (this->batch_size_ != 0) {
-    PutToFeedVec(&records_[batch.first], this->batch_size_);
-  } else {
-    VLOG(3) << "finish reading for heterps, batch size zero, thread_id="
-            << thread_id_;
-  }
-  VLOG(3) << "enable heter next: " << offset_index_
-          << " batch_offsets: " << batch_offsets_.size()
-          << " baych_size: " << this->batch_size_;
-
-  return this->batch_size_;
-#else
-  return 0;
-#endif
 }
 
 #if defined(PADDLE_WITH_CUDA) && defined(PADDLE_WITH_HETERPS)
-void SlotRecordInMemoryDataFeed::BuildSlotBatchGPU(const int ins_num) {
+void SlotRecordInMemoryDataFeed::BuildSlotBatchGPU(const int ins_num, MiniBatchGpuPack* pack) {
   int offset_cols_size = (ins_num + 1);
+  // slot总数 = 样本数 * 每个样本的slot数
   size_t slot_total_num = (use_slot_size_ * offset_cols_size);
-  pack_->resize_gpu_slot_offsets(slot_total_num * sizeof(size_t));
+  // 创建保存全部slot-offset的bytes buffer
+  pack->resize_gpu_slot_offsets(slot_total_num * sizeof(size_t));
 
-  auto& value = pack_->value();
+  // gpu value
+  auto& value = pack->value();
   const UsedSlotGpuType* used_slot_gpu_types =
-      static_cast<const UsedSlotGpuType*>(pack_->get_gpu_slots());
+      static_cast<const UsedSlotGpuType*>(pack->get_gpu_slots());
+
+  // 填充gpu_slot_offset
   FillSlotValueOffset(ins_num, use_slot_size_,
-                      reinterpret_cast<size_t*>(pack_->gpu_slot_offsets()),
+                      reinterpret_cast<size_t*>(pack->gpu_slot_offsets()),
                       value.d_uint64_offset.data(), uint64_use_slot_size_,
                       value.d_float_offset.data(), float_use_slot_size_,
-                      used_slot_gpu_types);
-  size_t* d_slot_offsets = reinterpret_cast<size_t*>(pack_->gpu_slot_offsets());
+                      used_slot_gpu_types,
+                      pack->get_stream());
 
-  HostBuffer<size_t>& offsets = pack_->offsets();
+  size_t* d_slot_offsets = reinterpret_cast<size_t*>(pack->gpu_slot_offsets());
+
+  HostBuffer<size_t>& offsets = pack->offsets();
   offsets.resize(slot_total_num);
-  HostBuffer<void*>& h_tensor_ptrs = pack_->h_tensor_ptrs();
+  HostBuffer<void*>& h_tensor_ptrs = pack->h_tensor_ptrs();
   h_tensor_ptrs.resize(use_slot_size_);
   // alloc gpu memory
-  pack_->resize_tensor();
+  pack->resize_tensor();
 
-  LoDTensor& float_tensor = pack_->float_tensor();
-  LoDTensor& uint64_tensor = pack_->uint64_tensor();
+  LoDTensor& float_tensor = pack->float_tensor();
+  LoDTensor& uint64_tensor = pack->uint64_tensor();
+
+  // copy index
+  CUDA_CHECK(cudaMemcpyAsync(offsets.data(), d_slot_offsets,
+                        slot_total_num * sizeof(size_t),
+                        cudaMemcpyDeviceToHost, pack->get_stream()));
+
+  cudaStreamSynchronize(pack->get_stream());
 
   int64_t float_offset = 0;
   int64_t uint64_offset = 0;
+  size_t float_zero_slot_index = 0;
+  size_t uint64_zero_slot_index = 0;
 
-  // copy index
-  CUDA_CHECK(cudaMemcpy(offsets.data(), d_slot_offsets,
-                        slot_total_num * sizeof(size_t),
-                        cudaMemcpyDeviceToHost));
   for (int j = 0; j < use_slot_size_; ++j) {
-    auto& feed = feed_vec_[j];
-    if (feed == nullptr) {
-      h_tensor_ptrs[j] = nullptr;
-      continue;
+    if (scpoe_feed_vec_.size() > 0) {
+      if (scpoe_feed_vec_.begin()->second[j] == nullptr) {
+        h_tensor_ptrs[j] = nullptr;
+        continue;
+      }
+    } else {
+      if (feed_vec_[j] == nullptr) {
+        h_tensor_ptrs[j] = nullptr;
+        continue;
+      }
     }
 
     size_t* off_start_ptr = &offsets[j * offset_cols_size];
@@ -2675,15 +2739,77 @@ void SlotRecordInMemoryDataFeed::BuildSlotBatchGPU(const int ins_num) {
     // fill slot value with default value 0
     if (info.type[0] == 'f') {  // float
       if (total_instance > 0) {
+        h_tensor_ptrs[j] = float_tensor.data<float>() + float_offset;
+        float_offset += total_instance;
+      } else {
+        h_tensor_ptrs[j] = pack->float_tensor_vec()[float_zero_slot_index].mutable_data<float>({total_instance, 1}, this->place_);
+        float_zero_slot_index++;
+      }
+    } else if (info.type[0] == 'u') {  // uint64
+      if (total_instance > 0) {
+        h_tensor_ptrs[j] = uint64_tensor.data<int64_t>() + uint64_offset;
+        uint64_offset += total_instance;
+      } else {
+        h_tensor_ptrs[j] = pack->uint64_tensor_vec()[uint64_zero_slot_index].mutable_data<int64_t>({total_instance, 1}, this->place_);
+        uint64_zero_slot_index++;
+      }
+    }
+  }
+  void** dest_gpu_p = reinterpret_cast<void**>(pack->slot_buf_ptr());
+  CUDA_CHECK(cudaMemcpyAsync(dest_gpu_p, h_tensor_ptrs.data(),
+                        use_slot_size_ * sizeof(void*),
+                        cudaMemcpyHostToDevice, pack->get_stream()));
+
+  CopyForTensor(ins_num, use_slot_size_, dest_gpu_p,
+                (const size_t*)pack->gpu_slot_offsets(),
+                (const uint64_t*)value.d_uint64_keys.data(),
+                (const int*)value.d_uint64_offset.data(),
+                (const int*)value.d_uint64_lens.data(), uint64_use_slot_size_,
+                (const float*)value.d_float_keys.data(),
+                (const int*)value.d_float_offset.data(),
+                (const int*)value.d_float_lens.data(), float_use_slot_size_,
+                used_slot_gpu_types, pack->get_stream());
+}
+
+void SlotRecordInMemoryDataFeed::PackToScope(MiniBatchGpuPack* pack, const Scope* scope) {
+  int64_t float_offset = 0;
+  int64_t uint64_offset = 0;
+  size_t float_zero_slot_index = 0;
+  size_t uint64_zero_slot_index = 0;
+
+  int offset_cols_size = (pack->ins_num() + 1);
+  HostBuffer<size_t>& offsets = pack->offsets();
+  LoDTensor& float_tensor = pack->float_tensor();
+  LoDTensor& uint64_tensor = pack->uint64_tensor();
+
+  auto* feed_vec = &feed_vec_;
+  if (scope) {
+    CHECK(scpoe_feed_vec_.count(scope) > 0) << "scope not found.";
+    feed_vec = &scpoe_feed_vec_[scope];
+  }
+
+  CHECK(feed_vec != nullptr) << "feed_vec nullptr.";
+
+  for (int j = 0; j < use_slot_size_; ++j) {
+    auto& feed = (*feed_vec)[j];
+    if (feed == nullptr) {
+      continue;
+    }
+    size_t* off_start_ptr = &offsets[j * offset_cols_size];
+    int total_instance = static_cast<int>(off_start_ptr[offset_cols_size - 1]);
+    auto& info = used_slots_info_[j];
+
+    // fill slot value with default value 0
+    if (info.type[0] == 'f') {  // float
+      if (total_instance > 0) {
         feed->ShareDataWith(float_tensor.Slice(
             static_cast<int64_t>(float_offset),
             static_cast<int64_t>(float_offset + total_instance)));
         feed->Resize({total_instance, 1});
         float_offset += total_instance;
-        h_tensor_ptrs[j] = feed->mutable_data<float>(this->place_);
       } else {
-        h_tensor_ptrs[j] =
-            feed->mutable_data<float>({total_instance, 1}, this->place_);
+        feed->ShareDataWith(pack->float_tensor_vec()[float_zero_slot_index++]);
+        feed->Resize({total_instance, 1});
       }
     } else if (info.type[0] == 'u') {  // uint64
       if (total_instance > 0) {
@@ -2692,10 +2818,9 @@ void SlotRecordInMemoryDataFeed::BuildSlotBatchGPU(const int ins_num) {
             static_cast<int64_t>(uint64_offset + total_instance)));
         feed->Resize({total_instance, 1});
         uint64_offset += total_instance;
-        h_tensor_ptrs[j] = feed->mutable_data<int64_t>(this->place_);
       } else {
-        h_tensor_ptrs[j] =
-            feed->mutable_data<int64_t>({total_instance, 1}, this->place_);
+        feed->ShareDataWith(pack->uint64_tensor_vec()[uint64_zero_slot_index++]);
+        feed->Resize({total_instance, 1});
       }
     }
 
@@ -2714,28 +2839,37 @@ void SlotRecordInMemoryDataFeed::BuildSlotBatchGPU(const int ins_num) {
              offset_cols_size * sizeof(size_t));
     }
   }
-  void** dest_gpu_p = reinterpret_cast<void**>(pack_->slot_buf_ptr());
-  CUDA_CHECK(cudaMemcpy(dest_gpu_p, h_tensor_ptrs.data(),
-                        use_slot_size_ * sizeof(void*),
-                        cudaMemcpyHostToDevice));
-
-  CopyForTensor(ins_num, use_slot_size_, dest_gpu_p,
-                (const size_t*)pack_->gpu_slot_offsets(),
-                (const uint64_t*)value.d_uint64_keys.data(),
-                (const int*)value.d_uint64_offset.data(),
-                (const int*)value.d_uint64_lens.data(), uint64_use_slot_size_,
-                (const float*)value.d_float_keys.data(),
-                (const int*)value.d_float_offset.data(),
-                (const int*)value.d_float_lens.data(), float_use_slot_size_,
-                used_slot_gpu_types);
 }
+
+MiniBatchGpuPack* SlotRecordInMemoryDataFeed::get_pack(MiniBatchGpuPack* last_pack) {
+  if (last_pack != nullptr) {
+    free_pack_queue_.Push(last_pack);
+    return nullptr;
+  }
+
+  std::unique_lock<std::mutex> lock(pack_mutex_);
+  while (true) {
+    if (using_pack_queue_.Size() != 0) {
+      auto* pack = using_pack_queue_.Pop();
+      return pack;
+    }
+    bool is_end = pack_is_end_.load();
+    if (is_end) {
+      if (using_pack_queue_.Size() == 0) {
+        return nullptr;
+      }
+    }
+    std::this_thread::sleep_for(
+          std::chrono::microseconds(200));
+  }
+}
+
 
 MiniBatchGpuPack::MiniBatchGpuPack(const paddle::platform::Place& place,
                                    const std::vector<UsedSlotInfo>& infos) {
   place_ = place;
-  stream_ = dynamic_cast<platform::CUDADeviceContext*>(
-                platform::DeviceContextPool::Instance().Get(place))
-                ->stream();
+  stream_holder_.reset(new platform::stream::CUDAStream(place));
+  stream_ = stream_holder_->raw_stream();
 
   ins_num_ = 0;
   pv_num_ = 0;
@@ -2761,15 +2895,25 @@ MiniBatchGpuPack::MiniBatchGpuPack(const paddle::platform::Place& place,
   VLOG(3) << "begin get batch pack device id: " << device_id;
   // sync
   CUDA_CHECK(cudaStreamSynchronize(stream_));
+  float_tensor_vec_.resize(used_slot_size_);
+  uint64_tensor_vec_.resize(used_slot_size_);
 }
 
 MiniBatchGpuPack::~MiniBatchGpuPack() {}
 
+
+bool MiniBatchGpuPack::is_use() {
+  return is_using_;
+}
+
+void MiniBatchGpuPack::set_use_flag(bool is_use) {
+  is_using_ = is_use;
+}
+
 void MiniBatchGpuPack::reset(const paddle::platform::Place& place) {
   place_ = place;
-  stream_ = dynamic_cast<platform::CUDADeviceContext*>(
-                platform::DeviceContextPool::Instance().Get(place))
-                ->stream();
+  stream_holder_.reset(new platform::stream::CUDAStream(place));
+  stream_ = stream_holder_->raw_stream();
   ins_num_ = 0;
   pv_num_ = 0;
 }
@@ -2908,6 +3052,7 @@ void MiniBatchGpuPack::pack_float_data(const SlotRecord* ins_vec, int num) {
 }
 
 void MiniBatchGpuPack::pack_instance(const SlotRecord* ins_vec, int num) {
+  // VLOG(0) << "pack_instance, slot_record:" << ins_vec << ", num: " << num;
   ins_num_ = num;
   batch_ins_ = ins_vec;
   CHECK(used_uint64_num_ > 0 || used_float_num_ > 0);
