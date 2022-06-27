@@ -136,6 +136,14 @@ void PSGPUWorker::PrepareCudaGraph() {
     "c_allreduce_sum",
     "c_sync_comm_stream",
   };
+  // if none op is marked capture, disable cuda graph 
+  bool enable_cuda_graph_capture = false;
+  for (auto& op : ops_) {
+    if (op->HasAttr(enable_cuda_graph_capture_attr_name) && op->Attr<int>(enable_cuda_graph_capture_attr_name)) {
+      enable_cuda_graph_capture = true;
+      break;
+    }
+  }
   // when op is captured, its inputs and outputs and their grads will be never changed
   // so the capture attribute can infect another op whose all inputs and outputs nerver changed
   std::unordered_set<std::string> var_whitelist;
@@ -163,7 +171,7 @@ void PSGPUWorker::PrepareCudaGraph() {
     }
     if (!need_skip) {
       bool need_capture = false;
-      if (op_blacklist.find(op->Type()) == op_blacklist.end()) {
+      if (enable_cuda_graph_capture && op_blacklist.find(op->Type()) == op_blacklist.end()) {
         if (op->HasAttr(enable_cuda_graph_capture_attr_name) && op->Attr<int>(enable_cuda_graph_capture_attr_name)) {
           need_capture = true;
         }
