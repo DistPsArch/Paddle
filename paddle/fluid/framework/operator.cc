@@ -1456,18 +1456,6 @@ void OperatorWithKernel::RunImpl(const Scope& scope,
     platform::RecordEvent record_event("compute",
                                        platform::TracerEventType::OperatorInner,
                                        1, platform::EventRole::kInnerOp);
-
-
-    // infershape check
-    // RuntimeInferShapeContext infer_shape_ctx(*this, *runtime_ctx);
-    // std::vector<std::vector<DDim>> pre_dims;
-    // std::vector<std::vector<LoD>> pre_lod;
-    // auto outnames = Outputs();
-    // for (auto& var_name_item : outnames) {
-    //   pre_dims.push_back(infer_shape_ctx.GetOutputsDim(var_name_item.first));
-    //   pre_lod.push_back(infer_shape_ctx.GetOutputsLod(var_name_item.first));
-    // }
-
     if (run_phi_kernel_) {
       phi::KernelContext pt_kernel_context;
       // Do data transform before building KernelContext
@@ -1480,55 +1468,6 @@ void OperatorWithKernel::RunImpl(const Scope& scope,
       (*kernel_func_)(
           ExecutionContext(*this, exec_scope, *dev_ctx, *runtime_ctx));
     }
-
-    // if (all_kernels_must_compute_runtime_shape_) {
-    //   std::vector<std::vector<DDim>> after_dims;
-    //   std::vector<std::vector<LoD>> after_lod;
-    //   for (auto& var_name_item : outnames) {
-    //     after_dims.push_back(infer_shape_ctx.GetOutputsDim(var_name_item.first));
-    //     after_lod.push_back(infer_shape_ctx.GetOutputsLod(var_name_item.first));
-    //   }
-    //   if (pre_dims.size() != after_dims.size()) {
-    //     CHECK(false) << "dims error: " << Info().Proto().type();
-    //   }
-    //   for (size_t i = 0; i < pre_dims.size(); i++) {
-    //     if (pre_dims[i].size() != after_dims[i].size()) {
-    //       CHECK(false) << "dims error: " << Info().Proto().type();
-    //     }
-    //     for (size_t j = 0; j < pre_dims[i].size(); j++) {
-    //       if (pre_dims[i][j] != after_dims[i][j]) {
-    //         CHECK(false) << "dims error: " << Info().Proto().type();
-    //       }
-    //     }
-    //   }
-    //   if (pre_lod.size() != after_lod.size()) {
-    //     CHECK(false) << "lods error: " << Info().Proto().type();
-    //   }
-    //   for (size_t i = 0; i < pre_lod.size(); i++) {
-    //     if (pre_lod[i].size() != after_lod[i].size()) {
-    //       CHECK(false) << "lods error: " << Info().Proto().type();
-    //     }
-    //     for (size_t j = 0; j < pre_lod[i].size(); j++) {
-    //       auto& a = pre_lod[i][j];
-    //       auto& b = after_lod[i][j];
-    //       if (a.size() != b.size()) {
-    //         CHECK(false) << "lods error: " << Info().Proto().type();
-    //       }
-    //       for (size_t i = 0; i < a.size(); i++) {
-    //         const auto &a_level = a[i];
-    //         const auto &b_level = b[i];
-    //         if (a_level.size() != b_level.size()) {
-    //           CHECK(false) << "lods error: " << Info().Proto().type();
-    //         }
-    //         for (size_t j = 0; j < a_level.size(); j++) {
-    //           if (a_level[j] != b_level[j]) {
-    //             CHECK(false) << "lods error: " << Info().Proto().type();
-    //           }
-    //         }
-    //       }
-    //     }
-    //   }
-    // }
   }
 
   if (!transfered_inplace_vars.empty()) {
