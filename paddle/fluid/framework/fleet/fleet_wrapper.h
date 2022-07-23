@@ -272,7 +272,7 @@ class FleetWrapper {
                            std::vector<std::string> table_var_list,
                            bool load_combine);
 
-  void PrintTableStat(const uint64_t table_id);
+  void PrintTableStat(const uint64_t table_id, uint32_t pass_id, uint64_t threshold);
   void SetFileNumOneShard(const uint64_t table_id, int file_num);
   // mode = 0, load all feature
   // mode = 1, load delta feature, which means load diff

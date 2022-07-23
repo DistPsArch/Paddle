@@ -363,7 +363,7 @@ void PSGPUWrapper::BuildPull(std::shared_ptr<HeterContext> gpu_task) {
 #endif
 
   timeline.Start();
-  auto ptl_func = [this, &local_keys, &local_ptr, &fleet_ptr](int i) {
+  auto ptl_func = [this, &local_keys, &local_ptr, &fleet_ptr, &gpu_task](int i) {
     size_t key_size = local_keys[i].size();
     int32_t status = -1;
 #ifdef PADDLE_WITH_PSLIB
@@ -374,7 +374,7 @@ void PSGPUWrapper::BuildPull(std::shared_ptr<HeterContext> gpu_task) {
     while (true) {
       auto tt = fleet_ptr->pslib_ptr_->_worker_ptr->pull_sparse_ptr(i,
           reinterpret_cast<char**>(local_ptr[i].data()), this->table_id_,
-          local_keys[i].data(), key_size);
+          local_keys[i].data(), key_size, gpu_task->pass_id_);
       bool flag = true;
 
       tt.wait();
@@ -444,7 +444,7 @@ void PSGPUWrapper::BuildPull(std::shared_ptr<HeterContext> gpu_task) {
   };
 
   auto ptl_dynamic_mf_func = [this, &local_dim_keys, &local_dim_ptr,
-                              &fleet_ptr](int i, int j) {
+                              &fleet_ptr, &gpu_task](int i, int j) {
 #ifdef PADDLE_WITH_PSLIB
     size_t key_size = local_dim_keys[i][j].size();
     int32_t status = -1;
@@ -452,7 +452,7 @@ void PSGPUWrapper::BuildPull(std::shared_ptr<HeterContext> gpu_task) {
     while (true) {
       auto tt = fleet_ptr->pslib_ptr_->_worker_ptr->pull_sparse_ptr(i,
           reinterpret_cast<char**>(local_dim_ptr[i][j].data()), this->table_id_,
-          local_dim_keys[i][j].data(), key_size);
+          local_dim_keys[i][j].data(), key_size, gpu_task->pass_id_);
       bool flag = true;
 
       tt.wait();
@@ -942,7 +942,8 @@ void PSGPUWrapper::LoadIntoMemory(bool is_shuffle) {
   InitSlotInfo();
   std::shared_ptr<HeterContext> gpu_task = gpu_task_pool_.Get();
   gpu_task->Reset();
- 
+  
+  gpu_task->pass_id_ = (uint16_t)(dataset_->GetPassID()); 
   dataset_mutex_.lock();
   dataset_pipe_.push(dataset_);
   dataset_mutex_.unlock();

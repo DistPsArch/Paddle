@@ -43,6 +43,7 @@ third_party/
 bazel-*
 third_party/
 
+builder
 build_*
 # clion workspace.
 cmake-build-*

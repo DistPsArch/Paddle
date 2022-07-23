@@ -73,9 +73,23 @@ class DatasetBase(object):
         self.proto_desc.pipe_command = "cat"
         self.dataset = core.Dataset("MultiSlotDataset")
         self.thread_num = 1
+        self.pass_id = 0
         self.filelist = []
         self.use_ps_gpu = False
         self.psgpu = None
+
+    def set_pass_id(self, pass_id):
+        """
+        set_pass_id
+        """
+        self.pass_id = pass_id
+        self.dataset.set_pass_id(pass_id)
+
+    def get_pass_id(self):
+        """
+        get_pass_id
+        """
+        return self.pass_id
 
     def set_pipe_command(self, pipe_command):
         """
