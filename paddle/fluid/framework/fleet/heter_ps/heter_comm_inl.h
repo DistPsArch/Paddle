@@ -15,6 +15,7 @@ limitations under the License. */
 #ifdef PADDLE_WITH_HETERPS
 //#include "paddle/fluid/framework/fleet/heter_ps/heter_comm.h"
 #include <queue>
+#include "paddle/fluid/platform/device/gpu/gpu_primitives.h"
 
 namespace paddle {
 namespace framework {
@@ -178,6 +179,62 @@ __global__ void merge_gradient_embedx_kernel(const uint32_t* offset,
       float* rhs = (float*)(input + size_t(ori_index) * grad_value_size);
       merger.add_embedx_field(lhs, rhs, field_idx, gpu_accessor);
     }
+  }
+}
+
+template <typename GPUAccessor>
+__global__ void merge_gradient_atomic_kernel(const uint32_t* offset,
+                                             const uint32_t* fea_num,
+                                             const uint32_t* index,
+                                             const char* input,
+                                             char* output,
+                                             int n,
+                                             size_t grad_value_size,
+                                             CustomGradMerger& merger,
+                                             int push_max_dim, 
+                                             GPUAccessor gpu_accessor) {
+  const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < n) {
+    size_t value_idx = idx / push_max_dim;
+    size_t off = idx % push_max_dim;
+    uint32_t start = offset[value_idx];
+    uint32_t num = fea_num[value_idx];
+    int ori_index = index[start];
+    const float* rhs = (float*)(input + size_t(ori_index) * grad_value_size);
+    float* lhs = (float*)(output + value_idx * grad_value_size);
+    merger.copy_all_field(lhs, rhs, gpu_accessor);
+    switch (off) {
+      case 0:
+        paddle::platform::CudaAtomicAdd(&lhs[gpu_accessor.common_push_value.SlotIndex()],
+                                        rhs[gpu_accessor.common_push_value.SlotIndex()]);
+        break;
+      case 1:
+        paddle::platform::CudaAtomicAdd(&lhs[gpu_accessor.common_push_value.ShowIndex()],
+                                        rhs[gpu_accessor.common_push_value.ShowIndex()]);
+        break;
+      case 2:
+        paddle::platform::CudaAtomicAdd(&lhs[gpu_accessor.common_push_value.ClickIndex()],
+                                        rhs[gpu_accessor.common_push_value.ClickIndex()]);
+        break;
+      case 3:
+        paddle::platform::CudaAtomicAdd(&lhs[gpu_accessor.common_push_value.MfDimIndex()],
+                                        rhs[gpu_accessor.common_push_value.MfDimIndex()]);
+        break;
+      case 4:
+        paddle::platform::CudaAtomicAdd(&lhs[gpu_accessor.common_push_value.EmbedGIndex()],
+                                        rhs[gpu_accessor.common_push_value.EmbedGIndex()]);
+        break;
+      default:
+        int embedx_idx = off - 5;
+        // if (mf_dim < embedx_idx) {
+        //   return;
+        // }
+        paddle::platform::CudaAtomicAdd(
+            &lhs[gpu_accessor.common_push_value.EmbedGIndex() + embedx_idx],
+            rhs[gpu_accessor.common_push_value.EmbedGIndex() + embedx_idx]);
+        break;
+    }
+
   }
 }
 
@@ -866,20 +923,31 @@ void HeterComm<KeyType, ValType, GradType, GPUAccessor>::merge_grad(int gpu_num,
   PADDLE_ENFORCE_GPU_SUCCESS(cudaStreamSynchronize(stream));
   timeline.Pause();
   timeline.Start();
-  grid_size = (uniq_len - 1) / block_size_ + 1;
+  if (!use_merge_atomic_) {
+    grid_size = (uniq_len - 1) / block_size_ + 1;
 
-  merge_gradient_basic_kernel<<<grid_size, block_size_, 0, stream>>>(
-      d_offset, d_fea_num_info_ptr, d_index, (char*)d_grads,
-      (char*)d_merge_grads_ptr, uniq_len, grad_value_size, merger_, gpu_accessor_);
+    merge_gradient_basic_kernel<<<grid_size, block_size_, 0, stream>>>(
+        d_offset, d_fea_num_info_ptr, d_index, (char*)d_grads,
+        (char*)d_merge_grads_ptr, uniq_len, grad_value_size, merger_, gpu_accessor_);
 
-  const size_t grad_dim = max_mf_dim_;
-  if (grad_dim > 0) {
-    int grid_size2 = (uniq_len * grad_dim - 1) / block_size_ + 1;
-    merge_gradient_embedx_kernel<<<grid_size2, block_size_, 0, stream>>>(
-            d_offset, d_fea_num_info_ptr, d_index, (char*)d_grads, (char*)d_merge_grads_ptr, uniq_len * grad_dim, grad_dim, grad_value_size, merger_, gpu_accessor_);
+    const size_t grad_dim = max_mf_dim_;
+    if (grad_dim > 0) {
+      int grid_size2 = (uniq_len * grad_dim - 1) / block_size_ + 1;
+      merge_gradient_embedx_kernel<<<grid_size2, block_size_, 0, stream>>>(
+              d_offset, d_fea_num_info_ptr, d_index, (char*)d_grads, (char*)d_merge_grads_ptr, uniq_len * grad_dim, grad_dim, grad_value_size, merger_, gpu_accessor_);
+    }
+  } else {
+    // use merge atomic 
+    int push_max_dim = max_mf_dim_ + 5; // tmp set push_max_dim by max_dim + 5
+    grid_size = (uniq_len * push_max_dim - 1) / block_size_ + 1;
+    merge_gradient_atomic_kernel<<<grid_size, block_size_, 0, stream>>>(
+              d_offset, d_fea_num_info_ptr, d_index, (char*)d_grads, (char*)d_merge_grads_ptr, uniq_len * push_max_dim, grad_value_size, merger_, push_max_dim, gpu_accessor_);
+    
   }
+  
 
   PADDLE_ENFORCE_GPU_SUCCESS(cudaStreamSynchronize(stream));
+  
   timeline.Pause();
 
   timeline.Start();

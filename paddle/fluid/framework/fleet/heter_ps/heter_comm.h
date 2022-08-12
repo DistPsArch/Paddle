@@ -49,6 +49,12 @@ struct CustomGradMerger {
 
   template <typename GPUAccessor>
   __device__ __forceinline__
+  void copy_all_field(float* output, const float* input, GPUAccessor& gpu_accessor) {
+      gpu_accessor.PushValueFill(output, input);
+  }
+
+  template <typename GPUAccessor>
+  __device__ __forceinline__
   void copy_basic_field(float* output, const float* input, GPUAccessor& gpu_accessor) {
       gpu_accessor.PushValueFillBasic(output, input);
   }
@@ -241,6 +247,7 @@ class HeterComm {
   std::vector<std::shared_ptr<cub::CachingDeviceAllocator>> allocators_;
   int multi_mf_dim_{8};
   int max_mf_dim_ = 8;
+  int use_merge_atomic_ = 1;
 };
 
 }  // end namespace framework
