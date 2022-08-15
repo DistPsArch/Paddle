@@ -125,7 +125,6 @@ class PSGPUWrapper {
   void EndPass();
   void start_build_thread();
   void pre_build_thread();
-  void build_pull_thread();
   void build_task();
 
   void Finalize() {
@@ -135,13 +134,10 @@ class PSGPUWrapper {
     }
     data_ready_channel_->Close();
     buildcpu_ready_channel_->Close();
-    buildpull_ready_channel_->Close();
     gpu_free_channel_->Close();
     running_ = false;
     VLOG(3) << "begin stop pre_build_threads_";
     pre_build_threads_.join();
-    VLOG(3) << "begin stop buildpull_threads_";
-    buildpull_threads_.join();
     s_instance_ = nullptr;
     VLOG(3) << "PSGPUWrapper Finalize Finished.";
   }
@@ -202,8 +198,6 @@ class PSGPUWrapper {
       data_ready_channel_->SetCapacity(3);
       buildcpu_ready_channel_->Open();
       buildcpu_ready_channel_->SetCapacity(3);
-      buildpull_ready_channel_->Open();
-      buildpull_ready_channel_->SetCapacity(1);
       gpu_free_channel_->Open();
       gpu_free_channel_->SetCapacity(1);
 
@@ -510,13 +504,8 @@ class PSGPUWrapper {
       paddle::framework::ChannelObject<std::shared_ptr<HeterContext>>>
       gpu_free_channel_ =
           paddle::framework::MakeChannel<std::shared_ptr<HeterContext>>();
-  std::shared_ptr<
-      paddle::framework::ChannelObject<std::shared_ptr<HeterContext>>>
-      buildpull_ready_channel_ =
-          paddle::framework::MakeChannel<std::shared_ptr<HeterContext>>();
   std::shared_ptr<HeterContext> current_task_ = nullptr;
   std::thread pre_build_threads_;
-  std::thread buildpull_threads_;
   bool running_ = false;
   std::vector<std::shared_ptr<ThreadPool>> hbm_thread_pool_;
   std::vector<std::shared_ptr<ThreadPool>> pull_thread_pool_;
