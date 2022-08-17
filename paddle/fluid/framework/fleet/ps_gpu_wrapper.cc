@@ -800,20 +800,22 @@ void PSGPUWrapper::LoadIntoMemory(bool is_shuffle) {
   timer.Pause();
   VLOG(0) << "LoadIntoMemory cost: " << timer.ElapsedSec() << "s";
 
-  // local shuffle
-  if (is_shuffle) {
-    dataset_->LocalShuffle();
-  }
-  InitSlotInfo();
-  std::shared_ptr<HeterContext> gpu_task = gpu_task_pool_.Get();
-  gpu_task->Reset();
-  gpu_task->pass_id_ = (uint16_t)(dataset_->GetPassID()); 
+  if (dataset_->GetMemoryDataSize() > 0) {
+    // local shuffle
+    if (is_shuffle) {
+      dataset_->LocalShuffle();
+    }
+    InitSlotInfo();
+    std::shared_ptr<HeterContext> gpu_task = gpu_task_pool_.Get();
+    gpu_task->Reset();
+    gpu_task->pass_id_ = (uint16_t)(dataset_->GetPassID());
 
-  dataset_mutex_.lock();
-  dataset_pipe_.push(dataset_);
-  dataset_mutex_.unlock();
- 
-  data_ready_channel_->Put(gpu_task);
+    dataset_mutex_.lock();
+    dataset_pipe_.push(dataset_);
+    dataset_mutex_.unlock();
+
+    data_ready_channel_->Put(gpu_task);
+  }
   
   VLOG(3) << "End LoadIntoMemory(), dataset[" << dataset_ << "]";
 }
