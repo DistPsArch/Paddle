@@ -265,6 +265,7 @@ class SlotObjPool {
     }
     disable_pool_ = false;
     count_ = 0;
+    pending_ins_.store(0);
   }
   ~SlotObjPool() {
     ins_chan_->Close();
@@ -280,21 +281,33 @@ class SlotObjPool {
   }
   void get(SlotRecord* output, int n) {
     int size = 0;
-    mutex_.lock();
-    int left = static_cast<int>(alloc_.capacity());
-    if (left > 0) {
-      size = (left >= n) ? n : left;
-      for (int i = 0; i < size; ++i) {
-        output[i] = alloc_.acquire();
+    do {
+      mutex_.lock();
+      int left = static_cast<int>(alloc_.capacity());
+      if (left > 0) {
+        int tmp_size = (left >= n - size) ? n - size : left;
+
+        for (int i = size; i < size + tmp_size; ++i) {
+          output[i] = alloc_.acquire();
+        }
+        size += tmp_size;
       }
-    }
-    mutex_.unlock();
+      mutex_.unlock();
+      if (pending_ins_.load() >= 200000) {
+        usleep(1000);
+        continue;
+      } else {
+        break;
+      }
+    } while (true);
+
+
     count_ += n;
-    if (size == n) {
-      return;
-    }
     for (int i = size; i < n; ++i) {
       output[i] = make_slotrecord();
+    }
+    for (int i = 0; i < n; ++i) {
+      output[i]->clear(true);
     }
   }
   void put(std::vector<SlotRecord>* input) {
@@ -306,6 +319,7 @@ class SlotObjPool {
     input->clear();
   }
   void put(SlotRecord* input, size_t size) {
+    pending_ins_.fetch_add(size);
     CHECK(ins_chan_->WriteMove(size, input) == size);
   }
   void run(void) {
@@ -314,10 +328,12 @@ class SlotObjPool {
       if (input.empty()) {
         continue;
       }
+      pending_ins_.fetch_sub(input.size());
       // over max capacity
       size_t n = input.size();
       count_ -= n;
-      if (disable_pool_ || n + capacity() > max_capacity_) {
+//      if (disable_pool_ || n + capacity() > max_capacity_) {
+      if (disable_pool_) {
         for (auto& t : input) {
           free_slotrecord(t);
         }
@@ -365,6 +381,7 @@ class SlotObjPool {
   SlotObjAllocator<SlotRecordObject> alloc_;
   bool disable_pool_;
   std::atomic<long> count_;  // NOLINT
+  std::atomic<uint64_t> pending_ins_;
 };
 
 inline SlotObjPool& SlotRecordPool() {
