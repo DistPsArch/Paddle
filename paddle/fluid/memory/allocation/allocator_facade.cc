@@ -374,6 +374,7 @@ class AllocatorFacadePrivate {
       }
     }
 
+
     /* shared_lock_guard */ {
       std::shared_lock<std::shared_timed_mutex> lock_guard(
           cuda_allocator_mutex_);
@@ -387,6 +388,7 @@ class AllocatorFacadePrivate {
                               stream, place));
       }
     }
+
 
     /* unique_lock_guard */ {
       std::unique_lock<std::shared_timed_mutex> lock_guard(

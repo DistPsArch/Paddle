@@ -566,14 +566,14 @@ class MiniBatchGpuPack {
     if (used_float_num_ > 0) {
       int float_total_len = buf_.h_float_lens.back();
       if (float_total_len > 0) {
-        float_tensor_.mutable_data<float>({float_total_len, 1}, this->place_);
+        float_tensor_.mutable_data<float>({float_total_len, 1}, this->place_, phi_stream());
       }
     }
     if (used_uint64_num_ > 0) {
       int uint64_total_len = buf_.h_uint64_lens.back();
       if (uint64_total_len > 0) {
         uint64_tensor_.mutable_data<int64_t>({uint64_total_len, 1},
-                                             this->place_);
+                                             this->place_, phi_stream());
       }
     }
   }
@@ -591,9 +591,9 @@ class MiniBatchGpuPack {
 
   void resize_gpu_slot_offsets(const size_t slot_total_bytes) {
     if (gpu_slot_offsets_ == nullptr) {
-      gpu_slot_offsets_ = memory::AllocShared(place_, slot_total_bytes);
+      gpu_slot_offsets_ = memory::AllocShared(place_, slot_total_bytes, phi_stream());
     } else if (gpu_slot_offsets_->size() < slot_total_bytes) {
-      auto buf = memory::AllocShared(place_, slot_total_bytes);
+      auto buf = memory::AllocShared(place_, slot_total_bytes, phi_stream());
       gpu_slot_offsets_.swap(buf);
       buf = nullptr;
     }
@@ -607,6 +607,11 @@ class MiniBatchGpuPack {
 
   cudaStream_t get_stream() {
     return stream_;
+  }
+
+  // only for interface compatibility
+  phi::Stream phi_stream() {
+    return phi::Stream(reinterpret_cast<phi::StreamId>(stream_));
   }
 
  private:

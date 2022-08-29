@@ -636,6 +636,7 @@ class PSGPUWorker : public HogwildWorker {
   // async infershape
   int task_threads_num_ {6};
   int scope_num_ {task_threads_num_ + 1};
+  // int scope_num_ {1};
   std::atomic<int> thread_count_ {0};
   std::atomic<bool> stop_token_ {false};
   std::atomic<bool> pack_is_end_ {false};

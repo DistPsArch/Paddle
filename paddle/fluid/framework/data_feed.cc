@@ -2742,7 +2742,8 @@ void SlotRecordInMemoryDataFeed::BuildSlotBatchGPU(const int ins_num, MiniBatchG
         h_tensor_ptrs[j] = float_tensor.data<float>() + float_offset;
         float_offset += total_instance;
       } else {
-        h_tensor_ptrs[j] = pack->float_tensor_vec()[float_zero_slot_index].mutable_data<float>({total_instance, 1}, this->place_);
+        h_tensor_ptrs[j] = pack->float_tensor_vec()[float_zero_slot_index].mutable_data<float>({total_instance, 1},
+                            this->place_, pack->phi_stream());
         float_zero_slot_index++;
       }
     } else if (info.type[0] == 'u') {  // uint64
@@ -2750,7 +2751,8 @@ void SlotRecordInMemoryDataFeed::BuildSlotBatchGPU(const int ins_num, MiniBatchG
         h_tensor_ptrs[j] = uint64_tensor.data<int64_t>() + uint64_offset;
         uint64_offset += total_instance;
       } else {
-        h_tensor_ptrs[j] = pack->uint64_tensor_vec()[uint64_zero_slot_index].mutable_data<int64_t>({total_instance, 1}, this->place_);
+        h_tensor_ptrs[j] = pack->uint64_tensor_vec()[uint64_zero_slot_index].mutable_data<int64_t>({total_instance, 1},
+                            this->place_, pack->phi_stream());
         uint64_zero_slot_index++;
       }
     }
@@ -2889,7 +2891,7 @@ MiniBatchGpuPack::MiniBatchGpuPack(const paddle::platform::Place& place,
   }
   copy_host2device(&gpu_slots_, gpu_used_slots_.data(), gpu_used_slots_.size());
 
-  slot_buf_ptr_ = memory::AllocShared(place_, used_slot_size_ * sizeof(void*));
+  slot_buf_ptr_ = memory::AllocShared(place_, used_slot_size_ * sizeof(void*), phi_stream());
 
   int device_id = place_.GetDeviceId();
   VLOG(3) << "begin get batch pack device id: " << device_id;

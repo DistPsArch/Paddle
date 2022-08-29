@@ -48,6 +48,11 @@ T* mutable_data(const DDim& dims,
                 const phi::Place& place,
                 size_t requested_size = 0);
 
+template <typename T>
+T* mutable_data(const DDim& dims,
+                const phi::Place& place,
+                const phi::Stream& stream);
+
 void* mutable_data(const phi::Place& place,
                     paddle::experimental::DataType type,
                     size_t requested_size = 0);
