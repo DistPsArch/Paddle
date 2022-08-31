@@ -145,7 +145,6 @@ void* DenseTensor::mutable_data(const Place& place,
       holder_->size() < size + meta_.offset ||
       !(place.GetType() == phi::AllocationType::GPU &&
         paddle::memory::InSameStream(holder_, stream))) {
-    // VLOG(0) << "xhdebug mutable_data " << stream.id();
     holder_.reset();
     holder_ = paddle::memory::AllocShared(place, size, stream);
     meta_.offset = 0;
