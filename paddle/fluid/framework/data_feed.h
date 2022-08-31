@@ -545,7 +545,8 @@ struct BatchGPUValue {
 class MiniBatchGpuPack {
  public:
   MiniBatchGpuPack(const paddle::platform::Place& place,
-                   const std::vector<UsedSlotInfo>& infos);
+                   const std::vector<UsedSlotInfo>& infos,
+                   phi::StreamId stream_id);
   ~MiniBatchGpuPack();
 
   bool is_use();
@@ -611,7 +612,7 @@ class MiniBatchGpuPack {
 
   // only for interface compatibility
   phi::Stream phi_stream() {
-    return phi::Stream(reinterpret_cast<phi::StreamId>(stream_));
+    return phi::Stream(alloc_stream_id_);
   }
 
  private:
@@ -667,6 +668,8 @@ class MiniBatchGpuPack {
 
   std::shared_ptr<phi::Allocation> gpu_slot_offsets_ = nullptr;
   std::shared_ptr<phi::Allocation> slot_buf_ptr_ = nullptr;
+
+  phi::StreamId alloc_stream_id_ {0};
 };
 class MiniBatchGpuPackMgr {
   static const int MAX_DEIVCE_NUM = 16;
@@ -701,7 +704,15 @@ class MiniBatchGpuPackMgr {
         return pack_list_[device_id][i];
       }
     }
-    auto* pack = new MiniBatchGpuPack(place, infos);
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!alloc_stream_map_.count(device_id)) {
+        alloc_stream_map_.emplace(device_id, new platform::stream::CUDAStream(place));
+      }
+    }
+    phi::StreamId alloc_stream_id =
+          reinterpret_cast<phi::StreamId>(alloc_stream_map_[device_id]->raw_stream());
+    auto* pack = new MiniBatchGpuPack(place, infos, alloc_stream_id);
     pack->set_use_flag(true);
     pack_list_[device_id].push_back(pack);
     return pack;
@@ -709,6 +720,8 @@ class MiniBatchGpuPackMgr {
 
  private:
   std::vector<std::vector<MiniBatchGpuPack*>> pack_list_;
+  std::unordered_map<int, std::unique_ptr<platform::stream::CUDAStream>> alloc_stream_map_;
+  std::mutex mutex_;
 };
 // global mgr
 inline MiniBatchGpuPackMgr& BatchGpuPackMgr() {
