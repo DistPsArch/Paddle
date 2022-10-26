@@ -438,6 +438,9 @@ void PSGPUWorker::TrainFiles() {
           std::chrono::microseconds(200));
       }
       thread_scope = cur_task.scope;
+      auto pack = cur_task.pack;
+      device_reader_->SetInsIdVec(pack);
+
       // tensor share buffer
       std::vector<Variable*>& cur_scope_vars = need_reuse_var_vec_[thread_scope];
       PADDLE_ENFORCE_EQ(cur_scope_vars.size(), need_reuse_var_.size(),
@@ -455,7 +458,7 @@ void PSGPUWorker::TrainFiles() {
     if (cur_batch <= 0) {
       break;
     }
-
+    device_reader_->SetCurBatchSize(cur_batch);
     total_ins_num += cur_batch;
 
     if (shape_check_flag_.load()) {

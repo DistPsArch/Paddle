@@ -1497,6 +1497,7 @@ void PSGPUWrapper::InitializeGPUServer(const std::string& fleet_desc) {
     add_sparse_optimizer(config, sparse_table_accessor.embed_sgd_param());
     add_sparse_optimizer(
         config, sparse_table_accessor.embedx_sgd_param(), "mf_");
+    config["mf_embedx_dim"] = sparse_table_accessor.embedx_dim(); // default = 8
   }
   config["sparse_shard_num"] = sparse_table.shard_num();
 

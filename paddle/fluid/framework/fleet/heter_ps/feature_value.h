@@ -167,11 +167,13 @@ class CommonFeatureValueAccessor {
 
     // 根据mf_dim计算的总长度
     __host__ __device__ int Dim(int mf_dim) {
-      int tmp_embedx_sgd_dim = 1;
+      int tmp_embedx_sgd_dim = 1; // shared adagrad
       if (mf_optimizer_type_ == 3) {//adam
         tmp_embedx_sgd_dim = mf_dim * 2 + 2;
       } else if (mf_optimizer_type_ == 4) { //shared_adam
         tmp_embedx_sgd_dim = 4;
+      } else if (mf_optimizer_type_ == 2) { // std adagrad
+        tmp_embedx_sgd_dim = mf_dim;
       }
       return 9 + embed_sgd_dim + tmp_embedx_sgd_dim + mf_dim;
     }
@@ -183,11 +185,13 @@ class CommonFeatureValueAccessor {
 
     // 根据mf_dim 计算的 mf_size byte数
     __host__ __device__ int MFSize(int mf_dim) {
-      int tmp_embedx_sgd_dim = 1;
+      int tmp_embedx_sgd_dim = 1; // shared adagrad
       if (mf_optimizer_type_ == 3) { //adam
         tmp_embedx_sgd_dim = mf_dim * 2 + 2;
       } else if (mf_optimizer_type_ == 4) { //shared_adam
         tmp_embedx_sgd_dim = 4;
+      } else if (mf_optimizer_type_ = 2) { // std adagrad
+        tmp_embedx_sgd_dim = mf_dim;
       }
       return (tmp_embedx_sgd_dim + mf_dim) * sizeof(float);
     }
@@ -196,12 +200,14 @@ class CommonFeatureValueAccessor {
 
     __host__ __device__ int EmbedxWOffsetIndex(float* val) {
       // has mf 
-      int tmp_embedx_sgd_dim = 1;
+      int tmp_embedx_sgd_dim = 1; // shared adagrad
       if ((int)MfSize(val) > 0) {
         if (mf_optimizer_type_ == 3) {//adam
           tmp_embedx_sgd_dim = int(MfDim(val)) * 2 + 2;
         } else if (mf_optimizer_type_ == 4) { //shared_adam
           tmp_embedx_sgd_dim = 4;
+        } else if (mf_optimizer_type_ == 2) { // std adagrad
+          tmp_embedx_sgd_dim = int(MfDim(val));
         }
         return EmbedxG2SumIndex() + tmp_embedx_sgd_dim;
       } else {
@@ -297,9 +303,25 @@ class CommonFeatureValueAccessor {
     }
   };
 
-
   __host__ __device__ CommonFeatureValueAccessor() {}
   __host__ __device__ ~CommonFeatureValueAccessor() {}
+
+
+  #define DEFINE_GET_INDEX4( instance, field) \
+        __host__ __device__ int get_##field##_index() { \
+            return instance.field##Index(); \
+        }
+
+#ifdef PADDLE_WITH_PSLIB
+  DEFINE_GET_INDEX4(common_feature_value, Show)
+  DEFINE_GET_INDEX4(common_feature_value, Click)
+  DEFINE_GET_INDEX4(common_feature_value, EmbedW)
+  DEFINE_GET_INDEX4(common_feature_value, EmbedxW)
+  DEFINE_GET_INDEX4(common_feature_value, DeltaScore)
+  DEFINE_GET_INDEX4(common_feature_value, Slot)
+  DEFINE_GET_INDEX4(common_feature_value, EmbedG2Sum)
+  DEFINE_GET_INDEX4(common_feature_value, MfDim)
+#endif
 
   __host__ int Initialize() {
     // NOTE(zhangminxu): gpups' sparse table optimizer type,
@@ -323,7 +345,10 @@ class CommonFeatureValueAccessor {
     } else if (optimizer_type == 4) { //shared_adam
       common_feature_value.embed_sgd_dim = 4;
       common_feature_value.embedx_sgd_dim = 4;
-    } else {
+    } else if (optimizer_type == 2) { // std adagrad
+      common_feature_value.embed_sgd_dim = 1;
+      common_feature_value.embedx_sgd_dim = sparse_embedx_dim;
+    } else if (optimizer_type == 1) { // shared adagrad
       common_feature_value.embed_sgd_dim = 1;
       common_feature_value.embedx_sgd_dim = 1;
     }

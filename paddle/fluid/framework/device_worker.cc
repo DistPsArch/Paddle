@@ -168,7 +168,7 @@ void DeviceWorker::DumpField(const Scope& scope, int dump_mode,
       continue;
     }
     ars[i] += ins_id_vec[i];
-    ars[i] = ars[i] + "\t" + ins_content_vec[i];
+    if (ins_content_vec.size() > i) ars[i] = ars[i] + "\t" + ins_content_vec[i];
   }
   for (auto& field : *dump_fields_) {
     Variable* var = scope.FindVar(field);

@@ -241,6 +241,14 @@ class PSGPUWrapper {
                                : config["sparse_shard_num"];
     thread_keys_shard_num_ = sparse_shard_num;
     VLOG(0) << "GPUPS set sparse shard num: " << thread_keys_shard_num_;
+    
+    // set mf optimizer type
+    int mf_optimizer_type = (config.find("mf_optimizer_type") == config.end())
+                                ? 1
+                                : config["mf_optimizer_type"];
+    optimizer_type_ = mf_optimizer_type;
+
+    VLOG(0) << "GPUPS set mf optimizer type:" << optimizer_type_;
 
     hbm_thread_pool_.resize(thread_keys_shard_num_);
     for (size_t i = 0; i < hbm_thread_pool_.size(); i++) {
