@@ -849,7 +849,7 @@ void PSGPUWrapper::BuildGPUTask(std::shared_ptr<HeterContext> gpu_task) {
 
     for (int k = left; k < right; k++) {
       float* val = (float*)mem_pool->mem_address(k);
-      accessor_wrapper_ptr->BuildFill(val, device_dim_ptrs[k], cpu_accessor_, mf_dim);
+      accessor_wrapper_ptr->BuildFill(val, device_dim_ptrs[k], cpu_accessor_, mf_dim, accessor_type_);
     }
   };
     threads.resize(device_num * multi_mf_dim_);
@@ -1082,7 +1082,7 @@ void PSGPUWrapper::EndPass() {
       }
       size_t local_offset = (i - left) * feature_value_size;
       float* gpu_val = (float*)(test_build_values + local_offset);
-      accessor_wrapper_ptr->DumpFill(gpu_val, cpu_accessor_, mf_dim);
+      accessor_wrapper_ptr->DumpFill(gpu_val, cpu_accessor_, mf_dim, accessor_type_);
     }
     free(test_build_values);
   };
@@ -1488,7 +1488,8 @@ void PSGPUWrapper::InitializeGPUServer(const std::string& fleet_desc) {
     }
   } else if (accessor_class == "DownpourUnitAccessor" ||
              accessor_class == "DownpourDoubleUnitAccessor" ||
-             accessor_class == "DownpourCtrDymfAccessor") {
+             accessor_class == "DownpourCtrDoubleDymfAccessor" || 
+             accessor_class == "DownpourCtrFloatDymfAccessor") {
     config["nonclk_coeff"] = sparse_table_accessor_parameter.nonclk_coeff();
     config["clk_coeff"] = sparse_table_accessor_parameter.click_coeff();
     config["mf_create_thresholds"] = sparse_table_accessor.embedx_threshold();

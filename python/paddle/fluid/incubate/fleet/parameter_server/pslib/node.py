@@ -123,16 +123,16 @@ class DownpourServer(Server):
             # DownpourUnitAccessor        : for ctr task, has cvm, slot, embedding and sgd info
 
             support_accessor_class = [
-                'DownpourFeatureValueAccessor', 'DownpourCtrAccessor', 'DownpourCtrDymfAccessor',
+                'DownpourFeatureValueAccessor', 'DownpourCtrAccessor', 'DownpourCtrDoubleDymfAccessor',
                 'DownpourSparseValueAccessor', 'DownpourCtrDoubleAccessor',
-                'DownpourUnitAccessor', 'DownpourDoubleUnitAccessor'
+                'DownpourUnitAccessor', 'DownpourDoubleUnitAccessor', 'DownpourCtrFloatDymfAccessor'
             ]
             if strategy.get('sparse_accessor_class') is not None:
                 accessor_class = strategy.get('sparse_accessor_class')
                 if accessor_class not in support_accessor_class:
                     raise ValueError(
-                        "support sparse_accessor_class: ['DownpourFeatureValueAccessor', 'DownpourCtrAccessor', 'DownpourCtrDymfAccessor', \
-                        'DownpourSparseValueAccessor', 'DownpourCtrDoubleAccessor'], \
+                        "support sparse_accessor_class: ['DownpourFeatureValueAccessor', 'DownpourCtrAccessor', 'DownpourCtrDoubleDymfAccessor', \
+                        'DownpourSparseValueAccessor', 'DownpourCtrDoubleAccessor', 'DownpourCtrFloatDymfAccessor'], \
                             but actual %s" % (accessor_class))
             else:
                 accessor_class = 'DownpourCtrAccessor'
@@ -258,7 +258,8 @@ class DownpourServer(Server):
                 table2.deconverter = deconverter
             elif accessor_class == 'DownpourUnitAccessor' \
                       or accessor_class == 'DownpourDoubleUnitAccessor' \
-                      or accessor_class == 'DownpourCtrDymfAccessor':
+                      or accessor_class == 'DownpourCtrDoubleDymfAccessor' \
+                      or accessor_class == 'DownpourCtrFloatDymfAccessor':
                 self.add_sparse_table_common_config(table, strategy)
                 self.add_sparse_optimizer(table.accessor.embed_sgd_param,
                                           strategy, "embed_")
