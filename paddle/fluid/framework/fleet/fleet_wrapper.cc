@@ -1068,7 +1068,7 @@ void FleetWrapper::PushSparseFromTensorWithLabelAsync(
   int slot_offset = 0;
   int grad_dim = 0;
   // don't worry, user do not have to care about all these flags
-  if (accesor == "DownpourCtrAccessor" || accesor == "DownpourCtrDoubleDymfAccessor" || accesor == "DownpourCtrFloatDymfAccessor") {
+  if (accesor == "DownpourCtrAccessor" || accesor == "DownpourCtrDymfAccessor" || accesor == "DownpourCtrDoubleDymfAccessor") {
     dump_slot = true;
     slot_offset = 1;
     grad_dim = fea_dim - 2;

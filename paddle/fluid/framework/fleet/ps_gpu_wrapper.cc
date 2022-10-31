@@ -1488,8 +1488,8 @@ void PSGPUWrapper::InitializeGPUServer(const std::string& fleet_desc) {
     }
   } else if (accessor_class == "DownpourUnitAccessor" ||
              accessor_class == "DownpourDoubleUnitAccessor" ||
-             accessor_class == "DownpourCtrDoubleDymfAccessor" || 
-             accessor_class == "DownpourCtrFloatDymfAccessor") {
+             accessor_class == "DownpourCtrDymfAccessor" || 
+             accessor_class == "DownpourCtrDoubleDymfAccessor") {
     config["nonclk_coeff"] = sparse_table_accessor_parameter.nonclk_coeff();
     config["clk_coeff"] = sparse_table_accessor_parameter.click_coeff();
     config["mf_create_thresholds"] = sparse_table_accessor.embedx_threshold();

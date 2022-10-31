@@ -371,7 +371,7 @@ __host__ void BuildFill(float* gpu_val,
                         ::paddle::ps::ValueAccessor* _cpu_accessor,
                         int mf_dim) {
 #if defined PADDLE_WITH_PSLIB
-  auto* cpu_accessor = dynamic_cast<::paddle::ps::DownpourCtrDymfAccessor<ShowClickType>*>(_cpu_accessor);
+  auto* cpu_accessor = dynamic_cast<::paddle::ps::DownpourCtrDymfTplAccessor<ShowClickType>*>(_cpu_accessor);
   auto* cpu_val = reinterpret_cast<::paddle::ps::DownpourFixedFeatureValue*>(_cpu_val);
   float* ptr_val = cpu_val->data();
   size_t cpu_dim = cpu_val->size();
@@ -427,7 +427,7 @@ __host__ void DumpFill(float* gpu_val,
                        ::paddle::ps::ValueAccessor* _cpu_accessor,
                        int mf_dim) {
 #if defined PADDLE_WITH_PSLIB
-  auto* cpu_accessor = dynamic_cast<::paddle::ps::DownpourCtrDymfAccessor<ShowClickType>*>(_cpu_accessor);
+  auto* cpu_accessor = dynamic_cast<::paddle::ps::DownpourCtrDymfTplAccessor<ShowClickType>*>(_cpu_accessor);
   uint64_t cpu_addr = *(uint64_t*)(gpu_val + common_feature_value.CpuPtrIndex());
   auto* downpour_value = (::paddle::ps::DownpourFixedFeatureValue*)cpu_addr;
   int downpour_value_size = downpour_value->size();
@@ -760,7 +760,7 @@ class AccessorWrapper : public VirtualAccessor {
       void* cpu_val,
       ::paddle::ps::ValueAccessor* cpu_accessor,
       int mf_dim, std::string& accessor_type) {
-    if (accessor_type == "DownpourCtrFloatDymfAccessor") {
+    if (accessor_type == "DownpourCtrDymfAccessor") {
       gpu_accessor_.template BuildFill<float>(gpu_val, cpu_val, cpu_accessor, mf_dim);
     } else if (accessor_type == "DownpourCtrDoubleDymfAccessor") {
       gpu_accessor_.template BuildFill<double>(gpu_val, cpu_val, cpu_accessor, mf_dim);
@@ -775,7 +775,7 @@ class AccessorWrapper : public VirtualAccessor {
       float* gpu_val,
       paddle::ps::ValueAccessor* cpu_accessor,
       int mf_dim, std::string& accessor_type) {
-    if (accessor_type == "DownpourCtrFloatDymfAccessor") {
+    if (accessor_type == "DownpourCtrDymfAccessor") {
       gpu_accessor_.template DumpFill<float>(gpu_val, cpu_accessor, mf_dim);
     } else if (accessor_type == "DownpourCtrDoubleDymfAccessor") {
       gpu_accessor_.template DumpFill<double>(gpu_val, cpu_accessor, mf_dim);
@@ -825,7 +825,7 @@ class GlobalAccessorFactory {
     if (accessor_wrapper_ptr_ != nullptr) {
       return;
     }
-    if (accessor_type == "DownpourCtrFloatDymfAccessor" || accessor_type == "DownpourCtrDoubleDymfAccessor") {
+    if (accessor_type == "DownpourCtrDymfAccessor" || accessor_type == "DownpourCtrDoubleDymfAccessor") {
       accessor_wrapper_ptr_ = new AccessorWrapper<CommonFeatureValueAccessor>();
     } else {
       VLOG(0) << "GlobalAccessorFactory Init not support accessor_type:"

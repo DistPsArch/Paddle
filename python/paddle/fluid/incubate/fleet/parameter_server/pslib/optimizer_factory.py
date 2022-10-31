@@ -338,10 +338,10 @@ class DistributedAdam(DistributedOptimizerImplBase):
         # set sparse_embedx_dim in the strategy according to accessor and use_cvm config
         if accessor == "DownpourFeatureValueAccessor" \
                 or accessor == "DownpourCtrAccessor" \
-                or accessor == "DownpourCtrDoubleDymfAccessor" \
+                or accessor == "DownpourCtrDymfAccessor" \
                 or accessor == "DownpourDoubleUnitAccessor" \
                 or accessor == "DownpourUnitAccessor" \
-                or accessor == 'DownpourCtrFloatDymfAccessor':
+                or accessor == 'DownpourCtrDoubleDymfAccessor':
             if st.get("sparse_embedx_dim") is not None \
                     and strategy.get("use_cvm") == True \
                     and st["sparse_embedx_dim"] != emb_to_size[table_name] - 3:
@@ -587,11 +587,11 @@ class DistributedAdam(DistributedOptimizerImplBase):
                 # set sparse_embedx_dim in strategy,
                 # user do not have to set it in config_fleet
                 if accessor == "DownpourFeatureValueAccessor" \
-                        or accessor == "DownpourCtrDoubleDymfAccessor" \
+                        or accessor == "DownpourCtrDymfAccessor" \
                         or accessor == "DownpourCtrAccessor" \
                         or accessor == "DownpourDoubleUnitAccessor" \
                         or accessor == "DownpourUnitAccessor" \
-                        or accessor == 'DownpourCtrFloatDymfAccessor':
+                        or accessor == 'DownpourCtrDoubleDymfAccessor':
                     if st.get("sparse_embedx_dim") is not None \
                             and st["sparse_embedx_dim"] != emb_to_size[key] - 3:
                         raise ValueError("fleet config sparse_embedx_dim=%s not"
@@ -876,8 +876,8 @@ class DistributedAdam(DistributedOptimizerImplBase):
         if server._server.downpour_server_param.downpour_table_param[
                 0].accessor.accessor_class in [
                     "DownpourCtrAccessor", "DownpourCtrDoubleAccessor",
-                    "DownpourUnitAccessor", "DownpourDoubleUnitAccessor", "DownpourCtrDoubleDymfAccessor", 
-                    "DownpourCtrFloatDymfAccessor"
+                    "DownpourUnitAccessor", "DownpourDoubleUnitAccessor", "DownpourCtrDymfAccessor", 
+                    "DownpourCtrDoubleDymfAccessor"
                 ]:
             opt_info["dump_slot"] = True
         elif server._server.downpour_server_param.downpour_table_param[
