@@ -190,7 +190,7 @@ class CommonFeatureValueAccessor {
         tmp_embedx_sgd_dim = mf_dim * 2 + 2;
       } else if (mf_optimizer_type_ == 4) { //shared_adam
         tmp_embedx_sgd_dim = 4;
-      } else if (mf_optimizer_type_ = 2) { // std adagrad
+      } else if (mf_optimizer_type_ == 2) { // std adagrad
         tmp_embedx_sgd_dim = mf_dim;
       }
       return (tmp_embedx_sgd_dim + mf_dim) * sizeof(float);
