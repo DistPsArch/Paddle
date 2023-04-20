@@ -37,6 +37,7 @@ namespace framework {
 const uint32_t MAX_FEASIGN_NUM = 1024 * 100 * 100;
 std::shared_ptr<FleetWrapper> FleetWrapper::s_instance_ = NULL;
 bool FleetWrapper::is_initialized_ = false;
+std::mutex FleetWrapper::ins_mutex;
 
 #ifdef PADDLE_WITH_PSLIB
 std::shared_ptr<paddle::distributed::PSlib> FleetWrapper::pslib_ptr_ = NULL;
@@ -69,18 +70,31 @@ void FleetWrapper::InitWorker(const std::string& dist_desc,
                               int node_num, int index) {
 #ifdef PADDLE_WITH_PSLIB
   if (!is_initialized_) {
-    VLOG(3) << "Going to init worker";
+    VLOG(0) << "Going to init worker";
     pslib_ptr_ = std::shared_ptr<paddle::distributed::PSlib>(
         new paddle::distributed::PSlib());
     pslib_ptr_->init_worker(dist_desc,
                             const_cast<uint64_t*>(host_sign_list.data()),
                             node_num, index);
+    dist_desc_ = dist_desc;
     is_initialized_ = true;
   } else {
     VLOG(3) << "Worker can be initialized only once";
   }
 #endif
 }
+
+std::string FleetWrapper::GetDistDesc() {
+  CHECK(is_initialized_ == true) << "fleetwrapper should be initialized first!!!";
+  return dist_desc_;
+}
+
+#ifdef PADDLE_WITH_PSLIB
+void FleetWrapper::GetCPUAccessor(::paddle::ps::ValueAccessor*& cpu_accessor) {
+  auto* cpu_accessor_ = pslib_ptr_->_worker_ptr->table_accessor(0);
+  cpu_accessor = cpu_accessor_;
+}
+#endif
 
 void FleetWrapper::StopServer() {
 #ifdef PADDLE_WITH_PSLIB
@@ -126,7 +140,7 @@ void FleetWrapper::GatherServers(const std::vector<uint64_t>& host_sign_list,
 
 void FleetWrapper::GatherClients(const std::vector<uint64_t>& host_sign_list) {
 #ifdef PADDLE_WITH_PSLIB
-  VLOG(3) << "Going to gather client ips";
+  VLOG(0) << "Going to gather client ips";
   size_t len = host_sign_list.size();
   pslib_ptr_->gather_clients(const_cast<uint64_t*>(host_sign_list.data()), len);
 #endif
@@ -142,7 +156,7 @@ std::vector<uint64_t> FleetWrapper::GetClientsInfo() {
 
 void FleetWrapper::CreateClient2ClientConnection() {
 #ifdef PADDLE_WITH_PSLIB
-  VLOG(3) << "Going to create client2client connection";
+  VLOG(0) << "Going to create client2client connection";
   pslib_ptr_->create_client2client_connection(client2client_request_timeout_ms_,
                                               client2client_connect_timeout_ms_,
                                               client2client_max_retry_);
@@ -1054,7 +1068,7 @@ void FleetWrapper::PushSparseFromTensorWithLabelAsync(
   int slot_offset = 0;
   int grad_dim = 0;
   // don't worry, user do not have to care about all these flags
-  if (accesor == "DownpourCtrAccessor") {
+  if (accesor == "DownpourCtrAccessor" || accesor == "DownpourCtrDymfAccessor" || accesor == "DownpourCtrDoubleDymfAccessor") {
     dump_slot = true;
     slot_offset = 1;
     grad_dim = fea_dim - 2;
@@ -1388,9 +1402,9 @@ void FleetWrapper::SetDate(const uint64_t table_id, const std::string& date) {
 #endif
 }
 
-void FleetWrapper::PrintTableStat(const uint64_t table_id) {
+void FleetWrapper::PrintTableStat(const uint64_t table_id, uint32_t pass_id, size_t threshold) {
 #ifdef PADDLE_WITH_PSLIB
-  auto ret = pslib_ptr_->_worker_ptr->print_table_stat(table_id);
+  auto ret = pslib_ptr_->_worker_ptr->print_table_stat(table_id, pass_id, threshold);
   ret.wait();
   int32_t err_code = ret.get();
   if (err_code == -1) {

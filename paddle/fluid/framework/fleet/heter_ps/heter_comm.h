@@ -19,6 +19,7 @@ limitations under the License. */
 #include "cub/util_allocator.cuh"
 #include "hashtable.h"       // NOLINT
 #include "heter_resource.h"  // NOLINT
+#include "paddle/fluid/framework/fleet/heter_ps/mem_pool.h"
 #include "paddle/fluid/framework/fleet/heter_ps/optimizer.cuh.h"
 #include "paddle/fluid/memory/allocation/allocator.h"
 #include "paddle/fluid/memory/memory.h"
@@ -26,6 +27,7 @@ limitations under the License. */
 #include "paddle/fluid/platform/dynload/nccl.h"
 #include "paddle/fluid/platform/place.h"
 #include "thrust/pair.h"
+#include "paddle/fluid/platform/timer.h"
 
 #ifdef PADDLE_WITH_HETERPS
 
@@ -38,20 +40,51 @@ struct CustomGradMerger {
   operator()(const T& a, const T& b) const {
     T out;
     out.slot = a.slot;
+    out.mf_dim = a.mf_dim;
     out.show = a.show + b.show;
     out.clk = a.clk + b.clk;
     out.lr_g = a.lr_g + b.lr_g;
-    for (int i = 0; i < MF_DIM; ++i) {
-      out.mf_g[i] = a.mf_g[i] + b.mf_g[i];
-    }
     return out;
   }
+
+  template <typename GPUAccessor>
+  __device__ __forceinline__
+  void copy_all_field(float* output, const float* input, GPUAccessor& gpu_accessor) {
+      gpu_accessor.PushValueFill(output, input);
+  }
+
+  template <typename GPUAccessor>
+  __device__ __forceinline__
+  void copy_basic_field(float* output, const float* input, GPUAccessor& gpu_accessor) {
+      gpu_accessor.PushValueFillBasic(output, input);
+  }
+
+  template <typename GPUAccessor>
+  __device__ __forceinline__
+  void add_basic_field(float* output, const float* input, GPUAccessor& gpu_accessor) {
+      gpu_accessor.MergePushValueBasic(output, input);
+  }
+
+
+  template <typename GPUAccessor>
+  __device__ __forceinline__
+  void copy_embedx_field(float* output, const float* input, size_t embedx_id, GPUAccessor& gpu_accessor) {
+       gpu_accessor.PushValueFillEmbedx(output, input, embedx_id);
+  }
+
+
+  template <typename GPUAccessor>
+  __device__ __forceinline__
+  void add_embedx_field(float* output, const float* input, size_t embedx_id, GPUAccessor& gpu_accessor) {
+       gpu_accessor.MergePushValueEmbedx(output, input, embedx_id);
+  }
+
 };
 
-template <typename KeyType, typename ValType, typename GradType>
+template <typename KeyType, typename ValType, typename GradType, typename GPUAccessor>
 class HeterComm {
  public:
-  HeterComm(size_t capacity, std::shared_ptr<HeterPsResource> resource);
+  HeterComm(size_t capacity, std::shared_ptr<HeterPsResource> resource, GPUAccessor& gpu_accessor);
   virtual ~HeterComm();
   HeterComm(const HeterComm&) = delete;
   HeterComm& operator=(const HeterComm&) = delete;
@@ -60,8 +93,12 @@ class HeterComm {
                             int* left, int* right, int gpu_num);
   void merge_grad(int gpu_num, KeyType* d_keys, GradType* d_grads, size_t len,
                   int& uniq_len);  // NOLINT
+  void merge_grad(int gpu_num, KeyType* d_keys, GradType* d_grads, float* mf,
+                  size_t len, int& uniq_len);
   void pull_sparse(int num, KeyType* d_keys, ValType* d_vals, size_t len);
   void build_ps(int num, KeyType* h_keys, ValType* h_vals, size_t len,
+                size_t chunk_size, int stream_num);
+  void build_ps(int num, KeyType* h_keys, char* pool, size_t len, size_t feature_value_size,
                 size_t chunk_size, int stream_num);
   void dump();
   void show_one_table(int gpu_num);
@@ -85,6 +122,9 @@ class HeterComm {
   int gather_multi_node_grad(int num, KeyType* d_keys, GradType* d_grads,
                              int len);
 
+  void set_sparse_sgd(const OptimizerConfig& optimizer_config);
+  void set_embedx_sgd(const OptimizerConfig& optimizer_config);
+
   int log2i(int x);
 
   void set_nccl_comm_and_size(const std::vector<ncclComm_t>& inner_comms,
@@ -93,6 +133,13 @@ class HeterComm {
     nccl_inner_comms_ = inner_comms;
     nccl_inter_comms_ = inter_comms;
     node_size_ = comm_size;
+  }
+  
+  void set_multi_mf_dim(int multi_mf_dim, int max_mf_dim) {
+    
+    multi_mf_dim_ = multi_mf_dim;
+    max_mf_dim_ = max_mf_dim;
+    VLOG(3) << "heter comm set multi multi_mf_dim_: " << multi_mf_dim_ << " max_mf_dim_: " << max_mf_dim_;
   }
 
   bool need_transfer(int send_id, int receive_id) {
@@ -111,8 +158,8 @@ class HeterComm {
     char* key_storage;
     char* val_storage;
     int sync;
-    int key_bytes_len;
-    int val_bytes_len;
+    size_t key_bytes_len;
+    size_t val_bytes_len;
     int gpu_num;
   };
 
@@ -166,16 +213,23 @@ class HeterComm {
 
   void init_path();
 
-  void create_storage(int start_index, int end_index, int keylen, int vallen);
+  void create_storage(int start_index, int end_index, size_t keylen, size_t vallen);
   void destroy_storage(int start_index, int end_index);
   void walk_to_dest(int start_index, int gpu_num, int* h_left, int* h_right,
                     KeyType* src_key, GradType* src_val);
+  void walk_to_dest(int start_index, int gpu_num, int* h_left, int* h_right,
+                    KeyType* src_key, char* src_val, size_t val_size);
   void walk_to_src(int start_index, int gpu_num, int* h_left, int* h_right,
                    ValType* src_val);
+  void walk_to_src(int start_index, int gpu_num, int* h_left, int* h_right,
+                   char* src_val, size_t val_size);
 
  protected:
+  GPUAccessor gpu_accessor_; 
   using Table = HashTable<KeyType, ValType>;
+  using PtrTable = HashTable<KeyType, ValType*>;
   std::vector<Table*> tables_;
+  std::vector<PtrTable*> ptr_tables_;
   std::shared_ptr<HeterPsResource> resource_;
   std::vector<std::vector<Path>> path_;
   float load_factor_{0.75};
@@ -191,6 +245,9 @@ class HeterComm {
   std::vector<ncclComm_t> nccl_inter_comms_;
   int node_size_;
   std::vector<std::shared_ptr<cub::CachingDeviceAllocator>> allocators_;
+  int multi_mf_dim_{8};
+  int max_mf_dim_ = 8;
+  int use_merge_atomic_ = 1;
 };
 
 }  // end namespace framework

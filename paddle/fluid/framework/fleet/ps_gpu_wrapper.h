@@ -16,10 +16,12 @@ limitations under the License. */
 
 #ifdef PADDLE_WITH_HETERPS
 
+#include <google/protobuf/text_format.h>
 #include <atomic>
 #include <ctime>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <string>
 #include <unordered_map>
@@ -48,6 +50,9 @@ limitations under the License. */
 #ifdef PADDLE_WITH_PSLIB
 #include "afs_api.h"
 #endif
+#ifdef PADDLE_WITH_PSLIB
+#include "downpour_accessor.h"  // NOLINT
+#endif
 
 namespace paddle {
 namespace framework {
@@ -71,6 +76,10 @@ class AfsWrapper {
 
   int download(const std::string& local_file, const std::string& afs_file);
 
+  int touchz(const std::string& path);
+  std::string cat(const std::string& path);
+  int mv(const std::string& old_path, const std::string& dest_path);
+
  private:
   paddle::ps::AfsApiWrapper afs_handler_;
 };
@@ -89,6 +98,12 @@ class PSGPUWrapper {
                   const std::vector<const uint64_t*>& keys,
                   const std::vector<float*>& values,
                   const std::vector<int64_t>& slot_lengths,
+                  const std::vector<int>& slot_dim,
+                  const int hidden_size);
+  void PullSparse(const paddle::platform::Place& place, const int table_id,
+                  const std::vector<const uint64_t*>& keys,
+                  const std::vector<float*>& values,
+                  const std::vector<int64_t>& slot_lengths,
                   const int hidden_size);
   void PushSparseGrad(const paddle::platform::Place& place, const int table_id,
                       const std::vector<const uint64_t*>& keys,
@@ -98,18 +113,9 @@ class PSGPUWrapper {
   void CopyKeys(const paddle::platform::Place& place, uint64_t** origin_keys,
                 uint64_t* total_keys, const int64_t* gpu_len, int slot_num,
                 int total_len);
-  void CopyForPull(const paddle::platform::Place& place, uint64_t** gpu_keys,
-                   const std::vector<float*>& values,
-                   const FeatureValue* total_values_gpu, const int64_t* gpu_len,
-                   const int slot_num, const int hidden_size,
-                   const int64_t total_length);
-
-  void CopyForPush(const paddle::platform::Place& place,
-                   const std::vector<const float*>& grad_values,
-                   FeaturePushValue* total_grad_values_gpu,
-                   const std::vector<int64_t>& slot_lengths,
-                   const int hidden_size, const int64_t total_length,
-                   const int batch_size);
+  void CopyKeys(const paddle::platform::Place& place, uint64_t** origin_keys,
+                uint64_t* total_keys, const int64_t* gpu_len, int slot_num,
+                int total_len, int* gpu_dim);
 
   void BuildGPUTask(std::shared_ptr<HeterContext> gpu_task);
   void PreBuildTask(std::shared_ptr<HeterContext> gpu_task);
@@ -119,6 +125,7 @@ class PSGPUWrapper {
   void EndPass();
   void start_build_thread();
   void pre_build_thread();
+  void build_pull_thread();
   void build_task();
 
   void Finalize() {
@@ -128,10 +135,13 @@ class PSGPUWrapper {
     }
     data_ready_channel_->Close();
     buildcpu_ready_channel_->Close();
+    buildpull_ready_channel_->Close();
     gpu_free_channel_->Close();
     running_ = false;
     VLOG(3) << "begin stop pre_build_threads_";
     pre_build_threads_.join();
+    VLOG(3) << "begin stop buildpull_threads_";
+    buildpull_threads_.join();
     s_instance_ = nullptr;
     VLOG(3) << "PSGPUWrapper Finalize Finished.";
   }
@@ -192,6 +202,8 @@ class PSGPUWrapper {
       data_ready_channel_->SetCapacity(3);
       buildcpu_ready_channel_->Open();
       buildcpu_ready_channel_->SetCapacity(3);
+      buildpull_ready_channel_->Open();
+      buildpull_ready_channel_->SetCapacity(1);
       gpu_free_channel_->Open();
       gpu_free_channel_->SetCapacity(1);
 
@@ -199,9 +211,19 @@ class PSGPUWrapper {
       gpu_free_channel_->Put(current_task_);
 
       table_id_ = 0;
-
       // start build cpu&gpu ps thread
       start_build_thread();
+#ifdef PADDLE_WITH_PSLIB
+      auto fleet_ptr = FleetWrapper::GetInstance();
+      std::string dist_desc = fleet_ptr->GetDistDesc();
+      fleet_ptr->GetCPUAccessor(cpu_accessor_);
+      PADDLE_ENFORCE_EQ(
+          cpu_accessor_ != nullptr, true,
+          platform::errors::PreconditionNotMet(
+              "You must initialize the cpu accessor first to use it."));
+      VLOG(0) << "PSGPUWrapper initialize cpu accessor";
+      InitializeGPUServer(dist_desc);
+#endif
     }
   }
 
@@ -211,12 +233,45 @@ class PSGPUWrapper {
   void SetEmbedxSGD(float mf_create_thresholds, float mf_learning_rate,
                     float mf_initial_g2sum, float mf_initial_range,
                     float mf_min_bound, float mf_max_bound);
-  void InitializeGPUServer(std::unordered_map<std::string, float> config) {
+
+  void InitializeGPUServer(std::unordered_map<std::string, float>& config) {
+    // set sparse shard num
+    int sparse_shard_num = (config.find("sparse_shard_num") == config.end())
+                               ? 37
+                               : config["sparse_shard_num"];
+    thread_keys_shard_num_ = sparse_shard_num;
+    VLOG(0) << "GPUPS set sparse shard num: " << thread_keys_shard_num_;
+    
+    // set mf optimizer type
+    int mf_optimizer_type = (config.find("mf_optimizer_type") == config.end())
+                                ? 1
+                                : config["mf_optimizer_type"];
+    optimizer_type_ = mf_optimizer_type;
+
+    VLOG(0) << "GPUPS set mf optimizer type:" << optimizer_type_;
+
+    hbm_thread_pool_.resize(thread_keys_shard_num_);
+    for (size_t i = 0; i < hbm_thread_pool_.size(); i++) {
+      hbm_thread_pool_[i].reset(new ::ThreadPool(1));
+    }
+    pull_thread_pool_.resize(thread_keys_shard_num_);
+    for (size_t i = 0; i < pull_thread_pool_.size(); i++) {
+      pull_thread_pool_[i].reset(new ::ThreadPool(1));
+    }
+    uniq_thread_pool_.resize(thread_keys_shard_num_);
+    for (size_t i = 0; i < uniq_thread_pool_.size(); i++) {
+      uniq_thread_pool_[i].reset(new ::ThreadPool(1));
+    }
+    VLOG(0) << "set hbm_thread_pool size: " << hbm_thread_pool_.size()
+            << " set pull_thread_pool size: " << pull_thread_pool_.size(); 
+
     float nonclk_coeff = (config.find("nonclk_coeff") == config.end())
                              ? 1.0
                              : config["nonclk_coeff"];
     float clk_coeff =
         (config.find("clk_coeff") == config.end()) ? 1.0 : config["clk_coeff"];
+
+    // lr config settings
     float min_bound = (config.find("min_bound") == config.end())
                           ? -10000.0
                           : config["min_bound"];
@@ -253,15 +308,21 @@ class PSGPUWrapper {
     float mf_max_bound = (config.find("mf_max_bound") == config.end())
                              ? 1.0
                              : config["mf_max_bound"];
-    for (size_t i = 0; i < heter_devices_.size(); i++) {
-      PADDLE_ENFORCE_GPU_SUCCESS(cudaSetDevice(heter_devices_[i]));
-      this->SetSparseSGD(nonclk_coeff, clk_coeff, min_bound, max_bound,
+    this->SetSparseSGD(nonclk_coeff, clk_coeff, min_bound, max_bound,
                          learning_rate, initial_g2sum, initial_range);
-      this->SetEmbedxSGD(mf_create_thresholds, mf_learning_rate,
-                         mf_initial_g2sum, mf_initial_range, mf_min_bound,
+    this->SetEmbedxSGD(mf_create_thresholds, mf_learning_rate,
+                        mf_initial_g2sum, mf_initial_range, mf_min_bound,
                          mf_max_bound);
-    }
+
+    VLOG(0) << "GPUOptimizer Config:\n" << "lr: min_bound:" << min_bound
+            << " max_bound:" << max_bound << " learning_rate:" << learning_rate
+            << " initial_g2sum:" << initial_g2sum << " initial_range:" << initial_range
+            << "\nmf: min_bound:" << mf_min_bound << " max_bound:" << max_bound
+            << " learning_rate:" << mf_learning_rate << " initial_g2sum:" << mf_initial_g2sum
+            << " initial_range:" << mf_initial_range << " create_thresholds:" << mf_create_thresholds;
+       
   }
+
   void SetDate(int year, int month, int day) {
     year_ = year;
     month_ = month;
@@ -272,8 +333,11 @@ class PSGPUWrapper {
 
   // PSGPUWrapper singleton
   static std::shared_ptr<PSGPUWrapper> GetInstance() {
-    if (NULL == s_instance_) {
-      s_instance_.reset(new paddle::framework::PSGPUWrapper());
+    {
+      std::lock_guard<std::mutex> lk(ins_mutex);
+      if (NULL == s_instance_) {
+        s_instance_.reset(new paddle::framework::PSGPUWrapper());
+      }
     }
     return s_instance_;
   }
@@ -292,7 +356,42 @@ class PSGPUWrapper {
   void SetSlotDimVector(const std::vector<int>& slot_mf_dim_vector) {
     slot_mf_dim_vector_ = slot_mf_dim_vector;
     assert(slot_mf_dim_vector_.size() == slot_vector_.size());
-    for (size_t i = 0; i < slot_mf_dim_vector.size(); i++) {
+  }
+
+  void InitSlotInfo() {
+    if (slot_info_initialized_) {
+      return;
+    }
+    SlotRecordDataset* dataset = dynamic_cast<SlotRecordDataset*>(dataset_);
+    auto slots_vec = dataset->GetSlots();
+    auto multi_slot_desc = dataset_->GetDataFeedDesc().multi_slot_desc();
+    std::vector<std::string> slots_vec_test;
+    for (int i = 0; i < multi_slot_desc.slots_size(); ++i) {
+      const auto& slot = multi_slot_desc.slots(i);
+      if (slot.type() == "uint64" || slot.type() == "uint32") {
+        slots_vec_test.push_back(slot.name());
+      }
+    }
+    std::cout << "wrapper use slots: ";
+    for (auto s : slots_vec_test) {
+      std::cout << s << " | ";
+    }
+    std::cout << " end wrapper " <<std::endl;
+    VLOG(0) << "get slot desc";
+    slot_offset_vector_.clear();
+    for (auto& slot : slot_vector_) {
+      for (size_t i = 0; i < slots_vec.size(); ++i) {
+        if (std::to_string(slot) == slots_vec[i]) {
+          slot_offset_vector_.push_back(i);
+          break;
+        }
+      }
+    }
+    for (auto s : slot_offset_vector_) {
+      std::cout << s << " | ";
+    }
+    std::cout << " end " <<std::endl;
+    for (size_t i = 0; i < slot_mf_dim_vector_.size(); i++) {
       slot_dim_map_[slot_vector_[i]] = slot_mf_dim_vector_[i];
     }
 
@@ -317,10 +416,17 @@ class PSGPUWrapper {
     for (size_t i = 0; i < slot_index_vec_.size(); i++) {
       slot_index_vec_[i] = dim_index_map[slot_mf_dim_vector_[i]];
     }
-    val_type_size_ =
-        TYPEALIGN(8, sizeof(FeatureValue) + sizeof(float) * (max_mf_dim_ + 1));
-    grad_type_size_ =
-        TYPEALIGN(8, sizeof(FeaturePushValue) + (max_mf_dim_ * sizeof(float)));
+    auto accessor_wrapper_ptr =
+        GlobalAccessorFactory::GetInstance().GetAccessorWrapper();
+    val_type_size_ = accessor_wrapper_ptr->GetFeatureValueSize(max_mf_dim_);
+    grad_type_size_ = accessor_wrapper_ptr->GetPushValueSize(max_mf_dim_);
+    VLOG(0) << "InitSlotInfo: val_type_size:" << val_type_size_
+            << " grad_type_size:" << grad_type_size_;
+    slot_info_initialized_ = true;
+  }
+
+  void SetCPUAccessorType(std::string accessor_class) {
+    accessor_type_ = accessor_class;
   }
 
   void ShowOneTable(int index) { HeterPs_->show_one_table(index); }
@@ -333,13 +439,30 @@ class PSGPUWrapper {
     return afs_handler_.open_reader(filename);
   }
 
+  std::shared_ptr<paddle::ps::AfsWriter> OpenWriter(
+      const std::string& filename) {
+    return afs_handler_.open_writer(filename);
+  }
+
   void InitAfsApi(const std::string& fs_name, const std::string& fs_user,
                   const std::string& pass_wd, const std::string& conf);
 #endif
 
  private:
+
+#ifdef PADDLE_WITH_PSLIB
+  ::paddle::ps::ValueAccessor* cpu_accessor_ = nullptr;
+#endif
+
   static std::shared_ptr<PSGPUWrapper> s_instance_;
+  static std::mutex ins_mutex;
   Dataset* dataset_;
+
+  //当load数据完成后，会将其筛入到如下队列，后续异步pull会用到这个队列的数据
+  //因为load 和 异步build是两个线程，所以才需要下面的队列来解耦这个dataset对象
+  std::queue<Dataset*> dataset_pipe_;
+  std::mutex dataset_mutex_;
+
 #ifdef PADDLE_WITH_PSLIB
   paddle::ps::AfsApiWrapper afs_handler_;
 #endif
@@ -360,6 +483,12 @@ class PSGPUWrapper {
   int max_mf_dim_{0};
   size_t val_type_size_{0};
   size_t grad_type_size_{0};
+
+  double time_1 = 0.0;
+  double time_2 = 0.0;
+  double time_3 = 0.0;
+  double time_4 = 0.0;
+
   int multi_node_{0};
   int node_size_;
   uint64_t table_id_;
@@ -372,13 +501,24 @@ class PSGPUWrapper {
   std::vector<std::vector<robin_hood::unordered_set<uint64_t>>> thread_keys_;
   std::vector<std::vector<std::vector<robin_hood::unordered_set<uint64_t>>>>
       thread_dim_keys_;
-  int thread_keys_thread_num_ = 37;
+  int thread_keys_thread_num_ = 37 * 4;
   int thread_keys_shard_num_ = 37;
   uint64_t max_fea_num_per_pass_ = 5000000000;
   int year_;
   int month_;
   int day_;
+  bool slot_info_initialized_ = false;
   int use_afs_api_ = 0;
+  
+  std::string accessor_type_ = "DownpourCtrDymfAccessor";
+  int optimizer_type_ = 1;
+
+#ifdef PADDLE_WITH_PSLIB
+  void InitializeGPUServer(const std::string& fleet_desc);
+  // _ps_param for gpups optimizer config
+  ::paddle::PSParameter _ps_param;
+#endif
+
 
   std::vector<MemoryPool*> mem_pools_;
   std::vector<HBMMemoryPool*> hbm_pools_;  // in multi mfdim, one table need hbm
@@ -396,10 +536,18 @@ class PSGPUWrapper {
       paddle::framework::ChannelObject<std::shared_ptr<HeterContext>>>
       gpu_free_channel_ =
           paddle::framework::MakeChannel<std::shared_ptr<HeterContext>>();
+  std::shared_ptr<
+      paddle::framework::ChannelObject<std::shared_ptr<HeterContext>>>
+      buildpull_ready_channel_ =
+          paddle::framework::MakeChannel<std::shared_ptr<HeterContext>>();
   std::shared_ptr<HeterContext> current_task_ = nullptr;
   std::thread pre_build_threads_;
+  std::thread buildpull_threads_;
   bool running_ = false;
-
+  std::vector<std::shared_ptr<ThreadPool>> hbm_thread_pool_;
+  std::vector<std::shared_ptr<ThreadPool>> pull_thread_pool_;
+  std::vector<std::shared_ptr<ThreadPool>> uniq_thread_pool_;
+  OptimizerConfig optimizer_config_;
  protected:
   static bool is_initialized_;
 };

@@ -73,9 +73,23 @@ class DatasetBase(object):
         self.proto_desc.pipe_command = "cat"
         self.dataset = core.Dataset("MultiSlotDataset")
         self.thread_num = 1
+        self.pass_id = 0
         self.filelist = []
         self.use_ps_gpu = False
         self.psgpu = None
+
+    def set_pass_id(self, pass_id):
+        """
+        set_pass_id
+        """
+        self.pass_id = pass_id
+        self.dataset.set_pass_id(pass_id)
+
+    def get_pass_id(self):
+        """
+        get_pass_id
+        """
+        return self.pass_id
 
     def set_pipe_command(self, pipe_command):
         """
@@ -738,6 +752,12 @@ class InMemoryDataset(DatasetBase):
         day = int(date[6:])
         if self.use_ps_gpu and core._is_compiled_with_heterps():
             self.psgpu.set_date(year, month, day)
+
+    def set_multi_task_num(self, multi_task_num=1):
+       """
+       Set multi task num
+       """
+       self.dataset.set_multi_task_num(multi_task_num)
 
     @deprecated(
         since="2.0.0",

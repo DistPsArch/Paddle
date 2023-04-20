@@ -125,6 +125,10 @@ struct SlotValues {
       slot_offsets.shrink_to_fit();
     }
   }
+  void shrink() {
+    slot_values.shrink_to_fit();
+    slot_offsets.shrink_to_fit();
+  }
 };
 union FeatureFeasign {
   uint64_t uint64_feasign_;
@@ -183,6 +187,10 @@ struct SlotRecordObject {
   void clear(bool shrink) {
     slot_uint64_feasigns_.clear(shrink);
     slot_float_feasigns_.clear(shrink);
+  }
+  void shrink() {
+    slot_uint64_feasigns_.shrink();
+    slot_float_feasigns_.shrink();
   }
 };
 using SlotRecord = SlotRecordObject*;
@@ -265,6 +273,7 @@ class SlotObjPool {
     }
     disable_pool_ = false;
     count_ = 0;
+    pending_ins_.store(0);
   }
   ~SlotObjPool() {
     ins_chan_->Close();
@@ -280,19 +289,27 @@ class SlotObjPool {
   }
   void get(SlotRecord* output, int n) {
     int size = 0;
-    mutex_.lock();
-    int left = static_cast<int>(alloc_.capacity());
-    if (left > 0) {
-      size = (left >= n) ? n : left;
-      for (int i = 0; i < size; ++i) {
-        output[i] = alloc_.acquire();
+    do {
+      mutex_.lock();
+      int left = static_cast<int>(alloc_.capacity());
+      if (left > 0) {
+        int tmp_size = (left >= n - size) ? n - size : left;
+
+        for (int i = size; i < size + tmp_size; ++i) {
+          output[i] = alloc_.acquire();
+        }
+        size += tmp_size;
       }
-    }
-    mutex_.unlock();
+      mutex_.unlock();
+      if (pending_ins_.load() >= 200000) {
+        usleep(1000);
+        continue;
+      } else {
+        break;
+      }
+    } while (true);
+
     count_ += n;
-    if (size == n) {
-      return;
-    }
     for (int i = size; i < n; ++i) {
       output[i] = make_slotrecord();
     }
@@ -306,6 +323,7 @@ class SlotObjPool {
     input->clear();
   }
   void put(SlotRecord* input, size_t size) {
+    pending_ins_.fetch_add(size);
     CHECK(ins_chan_->WriteMove(size, input) == size);
   }
   void run(void) {
@@ -314,10 +332,12 @@ class SlotObjPool {
       if (input.empty()) {
         continue;
       }
+      pending_ins_.fetch_sub(input.size());
       // over max capacity
       size_t n = input.size();
       count_ -= n;
-      if (disable_pool_ || n + capacity() > max_capacity_) {
+//      if (disable_pool_ || n + capacity() > max_capacity_) {
+      if (disable_pool_) {
         for (auto& t : input) {
           free_slotrecord(t);
         }
@@ -365,6 +385,7 @@ class SlotObjPool {
   SlotObjAllocator<SlotRecordObject> alloc_;
   bool disable_pool_;
   std::atomic<long> count_;  // NOLINT
+  std::atomic<uint64_t> pending_ins_;
 };
 
 inline SlotObjPool& SlotRecordPool() {
@@ -393,6 +414,8 @@ class CustomParser {
   virtual ~CustomParser() {}
   virtual void Init(const std::vector<SlotConf>& slots) = 0;
   virtual bool Init(const std::vector<AllSlotInfo>& slots) = 0;
+  virtual bool PreLoad(const std::vector<AllSlotInfo>& slots) { return true;}
+  virtual void Reset() {}
   virtual void ParseOneInstance(const char* str, Record* instance) = 0;
   virtual int ParseInstance(int len, const char* str,
                             std::vector<Record>* instances) {
@@ -528,8 +551,12 @@ struct BatchGPUValue {
 class MiniBatchGpuPack {
  public:
   MiniBatchGpuPack(const paddle::platform::Place& place,
-                   const std::vector<UsedSlotInfo>& infos);
+                   const std::vector<UsedSlotInfo>& infos,
+                   phi::StreamId stream_id);
   ~MiniBatchGpuPack();
+
+  bool is_use();
+  void set_use_flag(bool is_use);
   void reset(const paddle::platform::Place& place);
   void pack_instance(const SlotRecord* ins_vec, int num);
   int ins_num() { return ins_num_; }
@@ -546,19 +573,21 @@ class MiniBatchGpuPack {
     if (used_float_num_ > 0) {
       int float_total_len = buf_.h_float_lens.back();
       if (float_total_len > 0) {
-        float_tensor_.mutable_data<float>({float_total_len, 1}, this->place_);
+        float_tensor_.mutable_data<float>({float_total_len, 1}, this->place_, phi_stream());
       }
     }
     if (used_uint64_num_ > 0) {
       int uint64_total_len = buf_.h_uint64_lens.back();
       if (uint64_total_len > 0) {
         uint64_tensor_.mutable_data<int64_t>({uint64_total_len, 1},
-                                             this->place_);
+                                             this->place_, phi_stream());
       }
     }
   }
   LoDTensor& float_tensor(void) { return float_tensor_; }
   LoDTensor& uint64_tensor(void) { return uint64_tensor_; }
+  std::vector<LoDTensor>& float_tensor_vec(void) { return float_tensor_vec_; }
+  std::vector<LoDTensor>& uint64_tensor_vec(void) { return uint64_tensor_vec_; }
 
   HostBuffer<size_t>& offsets(void) { return offsets_; }
   HostBuffer<void*>& h_tensor_ptrs(void) { return h_tensor_ptrs_; }
@@ -569,9 +598,9 @@ class MiniBatchGpuPack {
 
   void resize_gpu_slot_offsets(const size_t slot_total_bytes) {
     if (gpu_slot_offsets_ == nullptr) {
-      gpu_slot_offsets_ = memory::AllocShared(place_, slot_total_bytes);
+      gpu_slot_offsets_ = memory::AllocShared(place_, slot_total_bytes, phi_stream());
     } else if (gpu_slot_offsets_->size() < slot_total_bytes) {
-      auto buf = memory::AllocShared(place_, slot_total_bytes);
+      auto buf = memory::AllocShared(place_, slot_total_bytes, phi_stream());
       gpu_slot_offsets_.swap(buf);
       buf = nullptr;
     }
@@ -581,6 +610,15 @@ class MiniBatchGpuPack {
       return ins_vec_[idx]->ins_id_;
     }
     return batch_ins_[idx]->ins_id_;
+  }
+
+  cudaStream_t get_stream() {
+    return stream_;
+  }
+
+  // only for interface compatibility
+  phi::Stream phi_stream() {
+    return phi::Stream(alloc_stream_id_);
   }
 
  private:
@@ -605,7 +643,9 @@ class MiniBatchGpuPack {
   }
 
  private:
+  bool is_using_ = false;
   paddle::platform::Place place_;
+  std::unique_ptr<platform::stream::CUDAStream> stream_holder_;
   cudaStream_t stream_;
   BatchGPUValue value_;
   BatchCPUValue buf_;
@@ -624,47 +664,70 @@ class MiniBatchGpuPack {
 
   // uint64 tensor
   LoDTensor uint64_tensor_;
+  std::vector<LoDTensor> uint64_tensor_vec_;
   // float tensor
   LoDTensor float_tensor_;
+  std::vector<LoDTensor> float_tensor_vec_;
   // batch
   HostBuffer<size_t> offsets_;
   HostBuffer<void*> h_tensor_ptrs_;
 
   std::shared_ptr<phi::Allocation> gpu_slot_offsets_ = nullptr;
   std::shared_ptr<phi::Allocation> slot_buf_ptr_ = nullptr;
+
+  phi::StreamId alloc_stream_id_ {0};
 };
 class MiniBatchGpuPackMgr {
   static const int MAX_DEIVCE_NUM = 16;
 
  public:
   MiniBatchGpuPackMgr() {
+    pack_list_.resize(MAX_DEIVCE_NUM);
     for (int i = 0; i < MAX_DEIVCE_NUM; ++i) {
-      pack_list_[i] = nullptr;
+      pack_list_[i].clear();
     }
   }
   ~MiniBatchGpuPackMgr() {
     for (int i = 0; i < MAX_DEIVCE_NUM; ++i) {
-      if (pack_list_[i] == nullptr) {
-        continue;
+      for (size_t j = 0; j < pack_list_[i].size(); j++) {
+        if (pack_list_[i][j] == nullptr) {
+          continue;
+        }
+        delete pack_list_[i][j];
+        pack_list_[i][j] = nullptr;
       }
-      delete pack_list_[i];
-      pack_list_[i] = nullptr;
     }
   }
-  // one device one thread
+
+  // thread unsafe
   MiniBatchGpuPack* get(const paddle::platform::Place& place,
                         const std::vector<UsedSlotInfo>& infos) {
     int device_id = place.GetDeviceId();
-    if (pack_list_[device_id] == nullptr) {
-      pack_list_[device_id] = new MiniBatchGpuPack(place, infos);
-    } else {
-      pack_list_[device_id]->reset(place);
+    for (size_t i = 0; i < pack_list_[device_id].size(); i++) {
+      if (!pack_list_[device_id][i]->is_use()) {
+        pack_list_[device_id][i]->set_use_flag(true);
+        pack_list_[device_id][i]->reset(place);
+        return pack_list_[device_id][i];
+      }
     }
-    return pack_list_[device_id];
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!alloc_stream_map_.count(device_id)) {
+        alloc_stream_map_.emplace(device_id, new platform::stream::CUDAStream(place));
+      }
+    }
+    phi::StreamId alloc_stream_id =
+          reinterpret_cast<phi::StreamId>(alloc_stream_map_[device_id]->raw_stream());
+    auto* pack = new MiniBatchGpuPack(place, infos, alloc_stream_id);
+    pack->set_use_flag(true);
+    pack_list_[device_id].push_back(pack);
+    return pack;
   }
 
  private:
-  MiniBatchGpuPack* pack_list_[MAX_DEIVCE_NUM];
+  std::vector<std::vector<MiniBatchGpuPack*>> pack_list_;
+  std::unordered_map<int, std::unique_ptr<platform::stream::CUDAStream>> alloc_stream_map_;
+  std::mutex mutex_;
 };
 // global mgr
 inline MiniBatchGpuPackMgr& BatchGpuPackMgr() {
@@ -744,9 +807,22 @@ class DLManager {
     if (it != handle_map_.end()) {
       return it->second.parser;
     }
+    // load so symbol
+    // 导出libps、core_avx符号给parser共享
+    const std::vector<std::string> packages {"libps.so", "core_avx.so"};
+    for (auto& package : packages) {
+      if (handle_map_.count(package) == 0) {
+        DLHandle handle_ps;
+        handle_ps.module = dlopen(package.c_str(), RTLD_NOW | RTLD_GLOBAL);
+        if (handle_ps.module == nullptr) {
+          VLOG(0) << "Create so of " << package << " fail, " << dlerror();
+        }
+        handle_map_.insert({package, handle_ps});
+      }
+    }
     handle.module = dlopen(name.c_str(), RTLD_NOW);
     if (handle.module == nullptr) {
-      VLOG(0) << "Create so of " << name << " fail";
+      VLOG(0) << "Create so of " << name << " fail, " << dlerror();
       exit(-1);
       return nullptr;
     }
@@ -812,6 +888,10 @@ class DataFeed {
   // This function is used for binding feed_vec memory in a given scope
   virtual void AssignFeedVar(const Scope& scope);
 
+  virtual std::vector<std::string> GetInputVarNames() {
+    return std::vector<std::string>();
+  }
+
   // This function will do nothing at default
   virtual void SetInputPvChannel(void* channel) {}
   // This function will do nothing at default
@@ -845,18 +925,36 @@ class DataFeed {
   virtual const std::vector<std::string>& GetInsIdVec() const {
     return ins_id_vec_;
   }
+  virtual void SetInsIdVec(MiniBatchGpuPack* pack) {}
   virtual const std::vector<std::string>& GetInsContentVec() const {
     return ins_content_vec_;
   }
   virtual int GetCurBatchSize() { return batch_size_; }
+  virtual void SetCurBatchSize(const int batch_size) { batch_size_ = batch_size; }
   virtual void LoadIntoMemory() {
     PADDLE_THROW(platform::errors::Unimplemented(
         "This function(LoadIntoMemory) is not implemented."));
+  }
+  virtual void BeginLoadIntoMemory() {
+    PADDLE_THROW(platform::errors::Unimplemented(
+        "This function(BeginLoadIntoMemory) is not implemented."));
+  }
+  virtual void EndLoadIntoMemory() {
+    PADDLE_THROW(platform::errors::Unimplemented(
+        "This function(EndLoadIntoMemory) is not implemented."));
   }
   virtual void SetPlace(const paddle::platform::Place& place) {
     place_ = place;
   }
   virtual const paddle::platform::Place& GetPlace() const { return place_; }
+
+#if defined(PADDLE_WITH_CUDA) && defined(PADDLE_WITH_HETERPS)
+  virtual MiniBatchGpuPack* get_pack(MiniBatchGpuPack* last_pack) { return nullptr; }
+  virtual void PackToScope(MiniBatchGpuPack* pack, const Scope* scope) {
+    PADDLE_THROW(platform::errors::Unimplemented(
+        "This function(PackToScope) is not implemented."));
+  }
+#endif
 
  protected:
   // The following three functions are used to check if it is executed in this
@@ -1295,6 +1393,113 @@ class RecordCandidateList {
   std::unordered_set<uint16_t> slot_index_to_replace_;
 };
 
+struct SlotRecordCandidate {
+  std::string ins_id_;
+  std::unordered_multimap<uint16_t, uint64_t> feas_;
+  size_t shadow_index_ = -1;  // Optimization for Reservoir Sample
+
+  SlotRecordCandidate() {}
+  SlotRecordCandidate(
+      const SlotRecord& rec,
+      const std::unordered_set<uint16_t>& slot_index_to_replace) {
+    int cnt = 0;
+    for (auto fea = 0; fea < static_cast<int>(
+                rec->slot_uint64_feasigns_.slot_offsets.size()) - 1; ++fea) {
+      if (slot_index_to_replace.find(fea) != slot_index_to_replace.end()) {
+        for (auto i = rec->slot_uint64_feasigns_.slot_offsets.at(cnt);
+             i < rec->slot_uint64_feasigns_.slot_offsets.at(cnt + 1);
+             i++) {
+          feas_.insert({cnt, rec->slot_uint64_feasigns_.slot_values.at(i)});
+        }
+      }
+      ++cnt;
+    }
+  }
+  SlotRecordCandidate& operator=(const SlotRecord& rec) {
+    feas_.clear();
+    ins_id_ = rec->ins_id_;
+    int len_slot = 
+        static_cast<int>(rec->slot_uint64_feasigns_.slot_offsets.size()) - 1;
+    for (auto cnt = 0; cnt < len_slot; ++cnt) {
+      for (auto i = rec->slot_uint64_feasigns_.slot_offsets.at(cnt);
+           i < rec->slot_uint64_feasigns_.slot_offsets.at(cnt + 1);
+           i++) {
+        feas_.insert({cnt, rec->slot_uint64_feasigns_.slot_values.at(i)});
+      }
+    }
+    return *this;
+  }
+};
+
+class SlotRecordCandidateList {
+ public:
+  SlotRecordCandidateList() = default;
+  SlotRecordCandidateList(const SlotRecordCandidateList&) {}
+
+  size_t Size() { return cur_size_; }
+  void ReSize(size_t length);
+
+  void ReInit();
+  void ReInitPass() {
+    for (size_t i = 0; i < cur_size_; ++i) {
+      if (candidate_list_[i].shadow_index_ != i) {
+        candidate_list_[i].ins_id_ =
+            candidate_list_[candidate_list_[i].shadow_index_].ins_id_;
+        candidate_list_[i].feas_.swap(
+            candidate_list_[candidate_list_[i].shadow_index_].feas_);
+        candidate_list_[i].shadow_index_ = i;
+      }
+    }
+    candidate_list_.resize(cur_size_);
+  }
+
+  void AddAndGet(const SlotRecord& record, SlotRecordCandidate* result);
+  void AddAndGet(const SlotRecord& record, size_t& index_result) {  // NOLINT
+    // std::unique_lock<std::mutex> lock(mutex_);
+    size_t index = 0;
+    ++total_size_;
+    auto fleet_ptr = FleetWrapper::GetInstance();
+    if (!full_) {
+      candidate_list_.emplace_back(record, slot_index_to_replace_);
+      candidate_list_.back().shadow_index_ = cur_size_;
+      ++cur_size_;
+      full_ = (cur_size_ == capacity_);
+    } else {
+      index = fleet_ptr->LocalRandomEngine()() % total_size_;
+      if (index < capacity_) {
+        candidate_list_.emplace_back(record, slot_index_to_replace_);
+        candidate_list_[index].shadow_index_ = candidate_list_.size() - 1;
+      }
+    }
+    index = fleet_ptr->LocalRandomEngine()() % cur_size_;
+    index_result = candidate_list_[index].shadow_index_;
+  }
+  const SlotRecordCandidate& Get(size_t index) const {
+    PADDLE_ENFORCE_LT(
+        index,
+        candidate_list_.size(),
+        platform::errors::OutOfRange("Your index [%lu] exceeds the number of "
+                                     "elements in candidate_list[%lu].",
+                                     index,
+                                     candidate_list_.size()));
+    return candidate_list_[index];
+  }
+  void SetSlotIndexToReplace(
+      const std::unordered_set<uint16_t>& slot_index_to_replace) {
+    slot_index_to_replace_ = slot_index_to_replace;
+  }
+
+ private:
+  size_t capacity_ = 0;
+  std::mutex mutex_;
+  bool full_ = false;
+  size_t cur_size_ = 0;
+  size_t total_size_ = 0;
+  std::vector<SlotRecordCandidate> candidate_list_;
+  std::unordered_set<uint16_t> slot_index_to_replace_;
+};
+
+
 template <class AR>
 paddle::framework::Archive<AR>& operator<<(paddle::framework::Archive<AR>& ar,
                                            const FeatureFeasign& fk) {
@@ -1390,16 +1595,26 @@ class MultiSlotInMemoryDataFeed : public InMemoryDataFeed<Record> {
 class SlotRecordInMemoryDataFeed : public InMemoryDataFeed<SlotRecord> {
  public:
   SlotRecordInMemoryDataFeed() {}
-  virtual ~SlotRecordInMemoryDataFeed() {
-#if defined(PADDLE_WITH_CUDA) && defined(PADDLE_WITH_HETERPS)
-    if (pack_ != nullptr) {
-      pack_ = nullptr;
-    }
-#endif
-  }
+  virtual ~SlotRecordInMemoryDataFeed();
+
   virtual void Init(const DataFeedDesc& data_feed_desc);
   virtual void LoadIntoMemory();
+  virtual void EndLoadIntoMemory();
+  virtual void BeginLoadIntoMemory();
   void ExpandSlotRecord(SlotRecord* ins);
+  uint64_t GetRecordTaskId(const paddle::framework::DataFeedDesc& data_feed_desc, 
+                           const SlotRecord& record);
+
+  virtual void SetInsIdVec(MiniBatchGpuPack* pack) {
+    if (parse_ins_id_) {
+      size_t ins_num = pack->ins_num(); 
+      ins_id_vec_.clear();
+      ins_id_vec_.resize(ins_num);
+      for(size_t i = 0; i < ins_num; i++) {
+        ins_id_vec_[i] = pack->get_lineid(i);
+      }
+    }
+  }
 
  protected:
   virtual bool Start();
@@ -1420,21 +1635,37 @@ class SlotRecordInMemoryDataFeed : public InMemoryDataFeed<SlotRecord> {
   bool ParseOneInstance(const std::string& line, SlotRecord* rec);
   virtual void PutToFeedVec(const SlotRecord* ins_vec, int num);
   virtual void AssignFeedVar(const Scope& scope);
+  virtual std::vector<std::string> GetInputVarNames() {
+    std::vector<std::string> var_names;
+    for (int i = 0; i < use_slot_size_; ++i) {
+      var_names.push_back(used_slots_info_[i].slot);
+    }
+    return var_names;
+  }
+
 #if defined(PADDLE_WITH_CUDA) && defined(PADDLE_WITH_HETERPS)
-  void BuildSlotBatchGPU(const int ins_num);
+  void BuildSlotBatchGPU(const int ins_num, MiniBatchGpuPack* pack);
+
+  // async infershape
+  virtual MiniBatchGpuPack* get_pack(MiniBatchGpuPack* last_pack);
+  virtual void PackToScope(MiniBatchGpuPack* pack, const Scope* scope = nullptr);
+
   void FillSlotValueOffset(const int ins_num, const int used_slot_num,
                            size_t* slot_value_offsets,
                            const int* uint64_offsets,
                            const int uint64_slot_size, const int* float_offsets,
                            const int float_slot_size,
-                           const UsedSlotGpuType* used_slots);
+                           const UsedSlotGpuType* used_slots,
+                           cudaStream_t stream
+                            );
   void CopyForTensor(const int ins_num, const int used_slot_num, void** dest,
                      const size_t* slot_value_offsets,
                      const uint64_t* uint64_feas, const int* uint64_offsets,
                      const int* uint64_ins_lens, const int uint64_slot_size,
                      const float* float_feas, const int* float_offsets,
                      const int* float_ins_lens, const int float_slot_size,
-                     const UsedSlotGpuType* used_slots);
+                     const UsedSlotGpuType* used_slots,
+                     cudaStream_t stream);
 #endif
   float sample_rate_ = 1.0f;
   int use_slot_size_ = 0;
@@ -1446,7 +1677,21 @@ class SlotRecordInMemoryDataFeed : public InMemoryDataFeed<SlotRecord> {
   std::vector<int> float_total_dims_without_inductives_;
 
 #if defined(PADDLE_WITH_CUDA) && defined(PADDLE_WITH_HETERPS)
-  MiniBatchGpuPack* pack_ = nullptr;
+  int pack_thread_num_ {5};
+  std::vector<std::thread> pack_threads_;
+  std::vector<MiniBatchGpuPack*> pack_vec_;
+  BlockingQueue<MiniBatchGpuPack*> free_pack_queue_;
+  BlockingQueue<MiniBatchGpuPack*> using_pack_queue_;
+  std::atomic<bool> pack_is_end_ {false};
+  std::atomic<uint64_t> pack_offset_index_ {0};
+  MiniBatchGpuPack* last_pack_ {nullptr};
+  std::atomic<bool> stop_token_ {false};
+  std::atomic<int> thread_count_ {0};
+  std::mutex pack_mutex_;
+
+  // async infershape
+  std::map<const Scope*, std::vector<LoDTensor*> > scpoe_feed_vec_;
+
 #endif
 };
 

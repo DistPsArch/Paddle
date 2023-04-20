@@ -103,11 +103,12 @@ class CUDAGraph {
 
   static bool IsThreadLocalCapturing() {
 #if CUDA_VERSION >= 10010
-    return IsCapturing() &&
-           capturing_graph_->capture_mode_ == cudaStreamCaptureModeThreadLocal;
-#else
-    return false;
+    if (IsCapturing()) {
+      std::atomic_thread_fence(std::memory_order_acquire);
+      return capture_mode_ == cudaStreamCaptureModeThreadLocal;
+    }
 #endif
+    return false;
   }
 
   static bool IsThisThreadCapturing() {
@@ -130,7 +131,6 @@ class CUDAGraph {
 #if CUDA_VERSION >= 10010
   std::vector<cudaGraph_t> graphs_;
   std::vector<cudaGraphExec_t> exec_graphs_;
-  cudaStreamCaptureMode capture_mode_;
 #endif
   cudaStream_t stream_{nullptr};
   platform::CUDAPlace place_;
@@ -140,6 +140,7 @@ class CUDAGraph {
   std::mutex mtx_;
 
   static paddle::optional<std::thread::id> capturing_thread_id_;
+  static volatile cudaStreamCaptureMode capture_mode_;
   static std::unique_ptr<CUDAGraph> capturing_graph_;
 };
 
@@ -150,7 +151,7 @@ class CUDAGraphCaptureModeGuard {
  public:
   explicit CUDAGraphCaptureModeGuard(
       cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed) {
-    if (UNLIKELY(CUDAGraph::IsCapturing())) {
+    if (UNLIKELY(CUDAGraph::IsThisThreadCapturing())) {
       PADDLE_ENFORCE_GPU_SUCCESS(cudaThreadExchangeStreamCaptureMode(&mode));
       // After cudaThreadExchangeStreamCaptureMode is called,
       // the variable "mode" would be set to the old capturing mode.
@@ -159,7 +160,7 @@ class CUDAGraphCaptureModeGuard {
   }
 
   ~CUDAGraphCaptureModeGuard() PADDLE_MAY_THROW {
-    if (UNLIKELY(CUDAGraph::IsCapturing())) {
+    if (UNLIKELY(CUDAGraph::IsThisThreadCapturing())) {
       PADDLE_ENFORCE_GPU_SUCCESS(
           cudaThreadExchangeStreamCaptureMode(&old_mode_));
     }

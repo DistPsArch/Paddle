@@ -181,6 +181,7 @@ __all__ = [
     'pixel_shuffle',
     'fsp_matrix',
     'continuous_value_model',
+    'scale_emb',
     'where',
     'sign',
     'deformable_conv',
@@ -711,8 +712,16 @@ def _pull_gpups_sparse(input,
         helper.create_variable_for_type_inference(dtype)
         for i in range(len(inputs))
     ]
+    largest_emb_size = 0;
+    if isinstance(size, list):
+        for i in range(len(size)):
+            if size[i] > largest_emb_size:
+                largest_emb_size = size[i]
+    else:
+        assert(isinstance(size, int))
+        largest_emb_size = size
     w = helper.create_parameter(
-        attr=helper.param_attr, shape=[11], dtype=dtype, is_bias=False)
+        attr=helper.param_attr, shape=[largest_emb_size], dtype=dtype, is_bias=False)
     helper.append_op(
         type='pull_gpups_sparse',
         inputs={'Ids': inputs,
@@ -14513,6 +14522,98 @@ def continuous_value_model(input, cvm, use_cvm=True):
         attrs={"use_cvm": use_cvm})
     return out
 
+
+def scale_emb(input,
+              emb_size,
+              bias,
+              show_ratio,
+              click_ratio,
+              lr_ratio,
+              mf_ratio):
+    r"""
+    **scale emb layers**
+    Now, this OP is used in CTR predictor to scale show, click lr and mf value in :attr:`input`.
+
+    :attr:`input` is an embedding vector, whose shape is :math:`[N, D]` (N is batch size. D is `embedding dim` ).
+    If :attr:`use_cvm` is True, it will calculate :math:`log(show)` and :math:`log(click)` , and output shape is :math:`[N, D]` .
+    If :attr:`use_cvm` is False, it will remove show and click from :attr:`input` , and output shape is :math:`[N, D - 2]` .
+    :attr:`cvm` is show_click info, whose shape is :math:`[N, 2]` .
+
+    Args:
+        input (Variable): The input variable. A 2-D LoDTensor with shape :math:`[N, D]` , where N is the batch size, D is `2 + the embedding dim` . `lod level = 1` .
+        A Tensor with type float32, float64.
+        cvm (Variable): Show and click variable. A 2-D Tensor with shape :math:`[N, 2]` , where N is the batch size, 2 is show and click.
+        A Tensor with type float32, float64.
+        use_cvm  (bool):  Use show_click or not. if use, the output dim is the same as input.
+                          if not use, the output dim is `input dim - 2` (remove show and click)
+
+    Returns:
+
+        Variable: A 2-D LodTensor with shape :math:`[N, M]` . if :attr:`use_cvm` = True, M is equal to input dim D. if False, M is equal to `D - 2`. \
+        A Tensor with same type as input.
+
+    Examples:
+
+        .. code-block:: python
+
+          import paddle.fluid as fluid
+          input = fluid.data(name="input", shape=[64, 1], dtype="int64")
+          label = fluid.data(name="label", shape=[64, 1], dtype="int64")
+          embed = fluid.layers.embedding(
+                            input=input,
+                            size=[100, 11],
+                            dtype='float32')
+          ones = fluid.layers.fill_constant_batch_size_like(input=label, shape=[-1, 1], dtype="int64", value=1)
+          show_clk = fluid.layers.cast(fluid.layers.concat([ones, label], axis=1), dtype='float32')
+          show_clk.stop_gradient = True
+          embed = fluid.layers.scale_emb(embed, show_ratio=1, click_ratio=8, lr_ratio=1024, mf_ratio=1024)
+          input_with_cvm = fluid.layers.continuous_value_model(embed, show_clk, True)
+    """
+    ## slice show, click, lr, mf, scale seperately and finally concat
+    helper = LayerHelper('scale_emb', **locals())
+    check_variable_and_dtype(input, 'input', ['float16', 'float32', 'float64'],
+                             'scale_emb')
+    ##show_index= fluid.layers.assign(np.array([0], dtype="int32"))
+    #click_index= fluid.layers.assign(np.array([1], dtype="int32"))
+    #lr_index= fluid.layers.assign(np.array([2], dtype="int32"))
+    #mf_index= fluid.layers.assign(np.array([2], dtype="int32"))
+    
+    axes = [1]
+    show_starts = [0]
+    show_ends = [1]
+    show_sliced = slice(input, axes=axes, starts=show_starts, ends=show_ends) 
+
+    click_starts = [1]
+    click_ends = [2]
+    click_sliced = slice(input, axes=axes, starts=click_starts, ends=click_ends) 
+
+    lr_starts = [2]
+    lr_ends = [3]
+    lr_sliced = slice(input, axes=axes, starts=lr_starts, ends=lr_ends)
+  
+    mf_starts = [3]
+    mf_ends = [emb_size + 1]
+    mf_sliced = slice(input, axes=axes, starts=mf_starts, ends=mf_ends)
+
+    show_ret = scale(show_sliced, scale=show_ratio, bias=bias)
+    click_ret = scale(click_sliced, scale=click_ratio, bias=bias)
+    lr_ret = scale(lr_sliced, scale=lr_ratio, bias=bias)
+    mf_ret = scale(mf_sliced, scale=mf_ratio, bias=bias)
+
+    #show_floor = floor(show_ret) 
+    #click_floor = floor(click_ret) 
+    #lr_floor = floor(lr_ret) 
+    #mf_floor = floor(mf_ret) 
+
+    #show_ret2 = scale(show_floor, scale=1.0/show_ratio, bias=0.0)
+    #click_ret2 = scale(click_floor, scale=1.0/click_ratio, bias=0.0)
+    #lr_ret2 = scale(lr_floor, scale=1.0/lr_ratio, bias=0.0)
+    #mf_ret2 = scale(mf_floor, scale=1.0/mf_ratio, bias=0.0)
+    
+    scale_ret = concat(input=[show_ret, click_ret, lr_ret, mf_ret], axis=1)
+    #scale_ret = concat(input=[show_sliced, click_sliced, lr_sliced, mf_sliced], axis=1)
+    return scale_ret
+    
 
 def where(condition):
     """

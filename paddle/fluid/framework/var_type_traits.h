@@ -21,6 +21,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "paddle/fluid/platform/place.h"
+#include "paddle/fluid/memory/memory.h"
 #include "paddle/fluid/framework/feed_fetch_type.h"
 #include "paddle/fluid/framework/lod_tensor_array.h"
 #include "paddle/fluid/framework/string_array.h"
@@ -97,6 +99,42 @@ class OrderedMultiDeviceLoDTensorBlockingQueueHolder;
 
 namespace paddle {
 namespace framework {
+
+class GpuPinnedVector {
+public:
+  GpuPinnedVector() {}
+  void cpu_to_pinedcpu(void* buf, size_t len) {
+    mem_cpu_ = memory::Alloc(phi::GPUPinnedPlace(), len);
+    memcpy(reinterpret_cast<char*>(mem_cpu_->ptr()), buf, len);
+    len_ = len;
+  }
+  void pinedcpu_to_gpu(paddle::gpuStream_t stream, phi::Place place) {
+    mem_gpu_ = memory::Alloc(place, len_);
+    cudaMemcpyAsync(reinterpret_cast<char*>(mem_gpu_->ptr()), reinterpret_cast<char*>(mem_cpu_->ptr()),
+                    len_, cudaMemcpyHostToDevice, stream);
+  }
+  void cpu_to_gpu(void* buf, size_t len, paddle::gpuStream_t stream, phi::Place place) {
+    mem_cpu_ = memory::Alloc(phi::GPUPinnedPlace(), len);
+    memcpy(reinterpret_cast<char*>(mem_cpu_->ptr()), buf, len);
+    mem_gpu_ = memory::Alloc(place, len);
+    cudaMemcpyAsync(reinterpret_cast<char*>(mem_gpu_->ptr()), reinterpret_cast<char*>(mem_cpu_->ptr()),
+                    len, cudaMemcpyHostToDevice, stream);
+    len_ = len;
+  }
+  template <typename Type>
+  Type* get_gpu_ptr() {
+    return reinterpret_cast<Type*>(mem_gpu_->ptr());
+  }
+  template <typename Type>
+  Type* get_cpu_ptr() {
+    return reinterpret_cast<Type*>(mem_cpu_->ptr());
+  }
+private:
+  memory::allocation::AllocationPtr mem_cpu_;
+  memory::allocation::AllocationPtr mem_gpu_;
+  size_t len_;
+};
+
 
 const char *ToTypeName(int var_id);
 const std::type_index &VarTraitIdToTypeIndex(int var_id);
@@ -189,7 +227,8 @@ using VarTypeRegistry = detail::VarTypeRegistryImpl<
 #if defined(PADDLE_WITH_CNCL)
     cnclCliqueId,
 #endif
-    int, float, Vocab>;
+    int, float, Vocab,
+    GpuPinnedVector>;
 template <typename T>
 struct VarTypeTrait {
   static_assert(VarTypeRegistry::IsRegistered<T>(), "Must be registered type");

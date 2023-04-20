@@ -44,6 +44,7 @@ limitations under the License. */
 #include "paddle/fluid/platform/place.h"
 #include "paddle/fluid/platform/timer.h"
 #include "paddle/phi/backends/dynload/port.h"
+#include "paddle/fluid/platform/device/gpu/cuda/cuda_graph.h"
 
 namespace paddle {
 namespace framework {
@@ -527,7 +528,7 @@ class HeterCpuWorker : public HogwildWorker {
 class PSGPUWorker : public HogwildWorker {
  public:
   PSGPUWorker() {}
-  virtual ~PSGPUWorker() {}
+  virtual ~PSGPUWorker();
   virtual void Initialize(const TrainerDesc& desc);
   virtual void TrainFiles();
   virtual void TrainFilesWithProfiler();
@@ -541,12 +542,27 @@ class PSGPUWorker : public HogwildWorker {
   virtual void SetEvent(const gpuEvent_t event) { event_ = event; }
   void ResetStat();
 
+  // async infershape
+  virtual void CreateDeviceResource(const ProgramDesc& main_prog);
+  virtual void BindingDataFeedMemory();
+
  protected:
   void PushGradients();
   void CopySparseTable();
   void CopyDenseTable();
   void CopyDenseVars();
+  void PrepareCudaGraph();
 
+  struct InferShapeCheckData {
+    std::vector<std::vector<DDim>> pre_dims;
+    std::vector<std::vector<LoD>> pre_lods;
+    std::vector<std::vector<DDim>> after_dims;
+    std::vector<std::vector<LoD>> after_lods;
+  };
+
+  int OpRunAndShapeCheck(OperatorBase& op,
+                          const Scope& scope,
+                          const platform::Place& place);
  private:
   int mpi_rank_;
   std::mutex mutex_;
@@ -554,6 +570,7 @@ class PSGPUWorker : public HogwildWorker {
   ProgramDesc program_;
   HeterObjectPool<HeterTask> object_pool_;
   bool need_to_push_dense_;
+
   bool dump_slot_;
   bool need_to_push_sparse_;
   DownpourWorkerParameter param_;
@@ -571,6 +588,14 @@ class PSGPUWorker : public HogwildWorker {
 
   // skipped ops
   std::vector<std::string> skip_ops_;
+
+  struct OpOrCudaGraph {
+    std::vector<OperatorBase*> ops;
+    bool need_capture;
+    std::unique_ptr<platform::CUDAGraph> cudagraph;
+    std::string name;
+  }; 
+  std::vector<OpOrCudaGraph> op_or_cudagraphs_;
 
   std::vector<::std::future<int32_t>> push_sparse_status_;
   std::vector<::std::future<int32_t>> push_dense_status_;
@@ -607,6 +632,29 @@ class PSGPUWorker : public HogwildWorker {
   double gpu_2_cpu_time_;
   double cpu_2_gpu_time_;
   uint64_t total_inst_;
+
+  // async infershape
+  int task_threads_num_ {6};
+  int scope_num_ {task_threads_num_ + 1};
+  // int scope_num_ {1};
+  std::atomic<int> thread_count_ {0};
+  std::atomic<bool> stop_token_ {false};
+  std::atomic<bool> pack_is_end_ {false};
+  std::vector<std::thread> task_threads_;
+  std::vector<Scope*> thread_scope_vec_;
+  std::map<Scope*, std::vector<Variable*>> need_reuse_var_vec_;
+  std::vector<Variable*> need_reuse_var_;
+
+  struct TaskData {
+    int ins_num;
+    Scope* scope;
+    MiniBatchGpuPack* pack;
+  };
+  paddle::framework::BlockingQueue<TaskData> free_task_queue_;
+  paddle::framework::BlockingQueue<TaskData> using_task_queue_;
+
+  static std::atomic<int> shape_check_count_;
+  static std::atomic<bool> shape_check_flag_;
 };
 #endif
 

@@ -107,6 +107,8 @@ class Scope : public ScopeBase {
   /// Caller doesn't own the returned Variable.
   Variable* FindVar(const std::string& name) const;
 
+  std::vector<Variable*> FindVarFromChild(const std::string& name) const;
+
   // Get a variable in the scope or any of its ancestors. Enforce
   /// the returned Variable is not nullptr
   Variable* GetVar(const std::string& name) const;

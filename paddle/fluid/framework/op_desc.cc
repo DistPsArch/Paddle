@@ -244,6 +244,8 @@ class CompileTimeInferShapeContext : public InferShapeContext {
 
   bool IsRunMKLDNNKernel() const override;
 
+  Scope* GetScopePtr() const override;  
+
   std::vector<proto::VarType::Type> GetInputsVarType(
       const std::string &name) const override {
     return GetVarTypes(Inputs(name));
@@ -946,6 +948,8 @@ void CompileTimeInferShapeContext::SetRepeatedDims(
 bool CompileTimeInferShapeContext::IsRuntime() const { return false; }
 
 bool CompileTimeInferShapeContext::IsRunMKLDNNKernel() const { return false; }
+
+Scope* CompileTimeInferShapeContext::GetScopePtr() const { return nullptr;}
 
 proto::VarType::Type CompileTimeInferShapeContext::GetVarType(
     const std::string &name) const {

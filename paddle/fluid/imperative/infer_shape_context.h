@@ -224,6 +224,10 @@ class DygraphInferShapeContext : public framework::InferShapeContext {
     return (op_kernel_type_ &&
             (op_kernel_type_->data_layout_ == framework::DataLayout::kMKLDNN));
   }
+  
+  framework::Scope* GetScopePtr() const override {
+    return nullptr;
+  }
 
   std::vector<framework::InferShapeVarPtr> GetInputVarPtrs(
       const std::string& name) const override {

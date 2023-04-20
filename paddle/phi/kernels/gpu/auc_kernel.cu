@@ -17,6 +17,7 @@
 #include "paddle/fluid/platform/device/gpu/gpu_primitives.h"
 #include "paddle/phi/backends/cpu/cpu_context.h"
 #include "paddle/phi/core/kernel_registry.h"
+#include <cub/cub.cuh>
 
 namespace phi {
 
@@ -59,7 +60,8 @@ __global__ void AddDataKernel(const int64_t *label_data,
                               int64_t *pos,
                               int64_t *neg,
                               const int numel,
-                              const int slide_steps) {
+                              const int slide_steps,
+                              bool ignore_illegal_label) {
   int cur_step_begin = 0;
   if (slide_steps > 0) {
     int cur_step_index =
@@ -68,12 +70,18 @@ __global__ void AddDataKernel(const int64_t *label_data,
     cur_step_begin = cur_step_index * (1 + num_thresholds);
   }
   CUDA_KERNEL_LOOP(i, numel) {
+    int64_t label = label_data[i];
+    if (ignore_illegal_label) {
+      if (label != 0 && label != 1) {
+        continue;
+      }
+    }
     auto predict_data = pred_data[i * inference_width + (inference_width - 1)];
-    PADDLE_ENFORCE(predict_data <= 1, "The predict data must less or equal 1.");
+    PADDLE_ENFORCE(predict_data <= 1, "The predict data(%f) must less or equal 1.", predict_data);
     PADDLE_ENFORCE(predict_data >= 0,
-                   "The predict data must gather or equal 0.");
+                   "The predict data(%f) must gather or equal 0.", predict_data);
     uint32_t binIdx = static_cast<uint32_t>(predict_data * num_thresholds);
-    if (label_data[i]) {
+    if (label) {
       paddle::platform::CudaAtomicAdd(pos + cur_step_begin + binIdx, 1);
     } else {
       paddle::platform::CudaAtomicAdd(neg + cur_step_begin + binIdx, 1);
@@ -81,34 +89,67 @@ __global__ void AddDataKernel(const int64_t *label_data,
   }
 }
 
+template <int BLOCKDIM>
 __global__ void CalcAucKernel(int64_t *stat_pos,
                               int64_t *stat_neg,
                               int num_thresholds,
                               double *auc,
                               bool need_add_batch_num) {
-  *auc = 0.0f;
-  double totPos = 0.0;
-  double totNeg = 0.0;
-  double totPosPrev = 0.0;
-  double totNegPrev = 0.0;
+  typedef cub::BlockScan<int64_t, BLOCKDIM> Int64BlockScan;
+  __shared__ typename Int64BlockScan::TempStorage int64_scan_storage;
 
-  int idx = num_thresholds;
+  typedef cub::BlockReduce<int64_t, BLOCKDIM> Int64BlockReduce;
+  __shared__ typename Int64BlockReduce::TempStorage int64_reduce_storage;
 
-  while (idx >= 0) {
-    totPosPrev = totPos;
-    totNegPrev = totNeg;
-    totPos += stat_pos[idx];
-    totNeg += stat_neg[idx];
-    *auc += (totNeg - totNegPrev) * (totPos + totPosPrev) / 2.0;
-    --idx;
+  typedef cub::BlockReduce<double, BLOCKDIM> DoubleBlockReduce;
+  __shared__ typename DoubleBlockReduce::TempStorage double_reduce_storage;
+
+  int64_t total_pos_num_local = 0; // thread_local_num
+  int64_t total_neg_num = 0; // global_num
+
+  double area_local = 0.0;
+  int block_begin_idx = 0;
+  for (; block_begin_idx < num_thresholds; block_begin_idx += BLOCKDIM) {
+    int idx = block_begin_idx + threadIdx.x;
+    int64_t pos_num = 0;
+    int64_t neg_num = 0;
+    if (idx <= num_thresholds) {
+      pos_num = stat_pos[idx];
+      neg_num = stat_neg[idx];
+    }
+    total_pos_num_local += pos_num;
+
+    int64_t block_aggregate = 0;
+    int64_t neg_prefix_sum = 0;
+    __syncthreads();
+    Int64BlockScan(int64_scan_storage).ExclusiveSum(neg_num, neg_prefix_sum, block_aggregate);
+    
+    neg_prefix_sum += total_neg_num;
+    total_neg_num += block_aggregate;
+    area_local += static_cast<double>(pos_num) * (neg_prefix_sum + neg_prefix_sum + neg_num);
   }
-
-  if (totPos > 0.0 && totNeg > 0.0) {
-    *auc = *auc / totPos / totNeg;
-  }
-  if (need_add_batch_num) {
-    stat_pos[num_thresholds + 1] += 1;
-    stat_neg[num_thresholds + 1] += 1;
+  
+  int64_t total_pos_num = Int64BlockReduce(int64_reduce_storage).Sum(total_pos_num_local);
+  double area = DoubleBlockReduce(double_reduce_storage).Sum(area_local);
+  
+  if (threadIdx.x == 0) {
+    if (block_begin_idx == num_thresholds) {
+      // for num_thresholds % BLOCKDIM == 0
+      int64_t pos_num = stat_pos[num_thresholds];
+      int64_t neg_num = stat_neg[num_thresholds];
+      area += static_cast<double>(pos_num) * (total_neg_num + total_neg_num + neg_num);
+      total_pos_num += pos_num;
+      total_neg_num += neg_num;
+    }
+    if (total_pos_num == 0 || total_neg_num == 0) {
+      *auc = 0.0;
+    } else {
+      *auc = area / total_pos_num / total_neg_num / 2.0;
+    }
+    if (need_add_batch_num) {
+      stat_pos[num_thresholds + 1] += 1;
+      stat_neg[num_thresholds + 1] += 1;
+    }
   }
 }
 
@@ -122,6 +163,7 @@ void statAuc(const Context &dev_ctx,
              const DenseTensor &predict,
              const int num_thresholds,
              const int slide_steps,
+             bool ignore_illegal_label,
              int64_t *origin_stat_pos,
              int64_t *origin_stat_neg) {
   size_t batch_size = predict.dims()[0];
@@ -142,7 +184,8 @@ void statAuc(const Context &dev_ctx,
                                         origin_stat_pos,
                                         origin_stat_neg,
                                         batch_size,
-                                        slide_steps);
+                                        slide_steps,
+                                        ignore_illegal_label);
     return;
   }
   // the last number of origin_stat_pos store the index should be used in
@@ -171,7 +214,8 @@ void statAuc(const Context &dev_ctx,
                                       origin_stat_pos,
                                       origin_stat_neg,
                                       batch_size,
-                                      slide_steps);
+                                      slide_steps,
+                                      ignore_illegal_label);
   UpdateSumDataKernel<<<(bucket_length + PADDLE_CUDA_NUM_THREADS - 1) /
                             PADDLE_CUDA_NUM_THREADS,
                         PADDLE_CUDA_NUM_THREADS,
@@ -189,6 +233,7 @@ void AucKernel(const Context &dev_ctx,
                const std::string &curve,
                int num_thresholds,
                int slide_steps,
+               bool ignore_illegal_label,
                DenseTensor *auc,
                DenseTensor *stat_pos_out,
                DenseTensor *stat_neg_out) {
@@ -202,39 +247,40 @@ void AucKernel(const Context &dev_ctx,
   auto *stat_neg_in_tensor = &stat_neg;
   auto *pos_in_data = stat_pos.data<int64_t>();
   auto *neg_in_data = stat_neg.data<int64_t>();
+  auto stream = dev_ctx.stream();
 #ifdef PADDLE_WITH_CUDA
   if (stat_pos_in_tensor != stat_pos_out) {
-    cudaMemcpy(
+    cudaMemcpyAsync(
         origin_stat_pos,
         pos_in_data,
         ((1 + slide_steps) * (num_thresholds + 1) + (slide_steps > 0 ? 1 : 0)) *
             sizeof(int64_t),
-        cudaMemcpyDeviceToDevice);
+        cudaMemcpyDeviceToDevice, stream);
   }
   if (stat_neg_in_tensor != stat_neg_out) {
-    cudaMemcpy(
+    cudaMemcpyAsync(
         origin_stat_neg,
         neg_in_data,
         ((1 + slide_steps) * (num_thresholds + 1) + (slide_steps > 0 ? 1 : 0)) *
             sizeof(int64_t),
-        cudaMemcpyDeviceToDevice);
+        cudaMemcpyDeviceToDevice, stream);
   }
 #else
   if (stat_pos_in_tensor != stat_pos_out) {
-    hipMemcpy(
+    hipMemcpyAsync(
         origin_stat_pos,
         pos_in_data,
         ((1 + slide_steps) * (num_thresholds + 1) + (slide_steps > 0 ? 1 : 0)) *
             sizeof(int64_t),
-        hipMemcpyDeviceToDevice);
+        hipMemcpyDeviceToDevice, stream);
   }
   if (stat_neg_in_tensor != stat_neg_out) {
-    hipMemcpy(
+    hipMemcpyAsync(
         origin_stat_neg,
         neg_in_data,
         ((1 + slide_steps) * (num_thresholds + 1) + (slide_steps > 0 ? 1 : 0)) *
             sizeof(int64_t),
-        hipMemcpyDeviceToDevice);
+        hipMemcpyDeviceToDevice, stream);
   }
 #endif
 
@@ -243,10 +289,11 @@ void AucKernel(const Context &dev_ctx,
                       input,
                       num_thresholds,
                       slide_steps,
+                      ignore_illegal_label,
                       origin_stat_pos,
                       origin_stat_neg);
   int sum_offset = slide_steps * (num_thresholds + 1);
-  CalcAucKernel<<<1, 1, 0, dev_ctx.stream()>>>(origin_stat_pos + sum_offset,
+  CalcAucKernel<512><<<1, 512, 0, dev_ctx.stream()>>>(origin_stat_pos + sum_offset,
                                                origin_stat_neg + sum_offset,
                                                num_thresholds,
                                                auc_value,

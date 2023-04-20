@@ -95,6 +95,25 @@ Variable* Scope::FindVar(const std::string& name) const {
   return FindVarInternal(name);
 }
 
+std::vector<Variable*> Scope::FindVarFromChild(const std::string& name) const {
+  std::vector<Variable*> ret;
+  {
+    SCOPE_VARS_READER_LOCK
+    auto it = vars_.find(name);
+    if (it != vars_.end()) {
+      ret.push_back(it->second.get());
+    }
+  }
+  {
+    SCOPE_KIDS_READER_LOCK
+    for (Scope* s : kids_) {
+      auto child_ret = s->FindVarFromChild(name);
+      ret.insert(ret.end(), child_ret.begin(), child_ret.end());
+    }
+  }
+  return ret;
+}
+
 Variable* Scope::GetVar(const std::string& name) const {
   auto* var = FindVar(name);
   PADDLE_ENFORCE_NOT_NULL(

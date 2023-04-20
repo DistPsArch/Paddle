@@ -168,6 +168,15 @@ inline T* DenseTensor::mutable_data(const DDim& dims,
 }
 
 template <typename T>
+inline T* DenseTensor::mutable_data(const DDim& dims,
+                                    const Place& place,
+                                    const phi::Stream& stream) {
+  static_assert(std::is_pod<T>::value, "T must be POD");
+  meta_.dims = dims;
+  return reinterpret_cast<T*>(mutable_data(place, paddle::experimental::CppTypeToDataType<T>::Type(), stream));
+}
+
+template <typename T>
 inline T* DenseTensor::mutable_data(const Place& place, size_t requested_size) {
   static_assert(std::is_pod<T>::value, "T must be POD");
   return reinterpret_cast<T*>(
@@ -186,7 +195,9 @@ void DenseTensor::ShareBufferWith(const DenseTensor& tensor) {
   template dtype* DenseTensor::mutable_data(                        \
       const DDim& dims, const Place& place, size_t requested_size); \
   template dtype* DenseTensor::mutable_data(const Place& place,     \
-                                            size_t requested_size);
+                                            size_t requested_size); \
+  template dtype* DenseTensor::mutable_data(                        \
+      const DDim& dims, const Place& place, const phi::Stream& stream);
 
 LEGACY_DATA_MEMBER_FUNC_INSTANTIATION(bool)
 LEGACY_DATA_MEMBER_FUNC_INSTANTIATION(int8_t)

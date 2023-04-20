@@ -13,7 +13,6 @@ See the License for the specific language governing permissions and
 limitations under the License. */
 
 #pragma once
-
 #include <memory>
 #ifdef PADDLE_WITH_PSLIB
 #include <archive.h>
@@ -23,6 +22,7 @@ limitations under the License. */
 #include <atomic>
 #include <ctime>
 #include <map>
+#include <mutex>
 #include <random>
 #include <string>
 #include <unordered_map>
@@ -240,6 +240,13 @@ class FleetWrapper {
   void InitWorker(const std::string& dist_desc,
                   const std::vector<uint64_t>& host_sign_list, int node_num,
                   int index);
+
+  std::string GetDistDesc();
+
+#ifdef PADDLE_WITH_PSLIB 
+  void GetCPUAccessor(::paddle::ps::ValueAccessor*& cpu_accessor);
+#endif
+
   // stop server
   void StopServer();
   // finalize worker to make worker can be stop
@@ -265,7 +272,7 @@ class FleetWrapper {
                            std::vector<std::string> table_var_list,
                            bool load_combine);
 
-  void PrintTableStat(const uint64_t table_id);
+  void PrintTableStat(const uint64_t table_id, uint32_t pass_id, uint64_t threshold);
   void SetFileNumOneShard(const uint64_t table_id, int file_num);
   // mode = 0, load all feature
   // mode = 1, load delta feature, which means load diff
@@ -328,8 +335,11 @@ class FleetWrapper {
   void Revert();
   // FleetWrapper singleton
   static std::shared_ptr<FleetWrapper> GetInstance() {
-    if (NULL == s_instance_) {
-      s_instance_.reset(new paddle::framework::FleetWrapper());
+    {
+      std::lock_guard<std::mutex> lk(ins_mutex);
+      if (NULL == s_instance_) {
+        s_instance_.reset(new paddle::framework::FleetWrapper());
+      }
     }
     return s_instance_;
   }
@@ -343,7 +353,9 @@ class FleetWrapper {
 #endif
 
  private:
+  std::string dist_desc_;
   static std::shared_ptr<FleetWrapper> s_instance_;
+  static std::mutex ins_mutex;
 #ifdef PADDLE_WITH_PSLIB
   std::map<uint64_t, std::vector<paddle::ps::Region>> _regions;
 #endif

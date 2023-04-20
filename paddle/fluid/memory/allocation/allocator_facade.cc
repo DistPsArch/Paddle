@@ -369,7 +369,7 @@ class AllocatorFacadePrivate {
       bool create_if_not_found = false) {
     if (LIKELY(!IsCUDAGraphCapturing())) {
       if (stream == GetDefaultStream(place)) {
-        VLOG(7) << "Get Allocator by passing in a default stream";
+        VLOG(0) << "Get Allocator by passing in a default stream";
         return GetAllocator(place, /* A non-zero num to choose allocator_ */ 1);
       }
     }
@@ -391,6 +391,7 @@ class AllocatorFacadePrivate {
     /* unique_lock_guard */ {
       std::unique_lock<std::shared_timed_mutex> lock_guard(
           cuda_allocator_mutex_);
+      VLOG(0) << "InitStreamSafeCUDAAllocator of " << reinterpret_cast<uint64_t>(stream);
       InitStreamSafeCUDAAllocator(place, stream);
       return cuda_allocators_[place][stream];
     }

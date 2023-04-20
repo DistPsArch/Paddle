@@ -44,7 +44,7 @@ __all__ = [
     'multiclass_nms2', 'search_pyramid_hash', 'shuffle_batch', 'partial_concat',
     'sparse_embedding', 'partial_sum', 'tdm_child', 'rank_attention',
     'tdm_sampler', 'batch_fc', '_pull_box_extended_sparse', 'bilateral_slice',
-    'correlation', 'fused_bn_add_act', 'fused_seqpool_cvm'
+    'correlation', 'fused_bn_add_act', 'fused_seqpool_cvm', 'weighted_random_sample'
 ]
 
 
@@ -603,6 +603,96 @@ def fused_seqpool_cvm(input,
 
     return outs
 
+def weighted_random_sample(self_input,
+                           other_input,
+                           feature_input,
+                           label_input,
+                           vec_sim_max=0.7,
+                           vec_sim_base=1.0,
+                           fea_match_base=1.0,
+                           random_rematch_ratio=1,
+                           do_random=False,
+                           use_global_random_rematch=False,
+                           weight_formula="default",
+                           need_initialize=False): 
+    """
+    :api_attr: Static Graph
+
+    This OP is the fusion of sequence_pool and continuous_value_model op.
+
+    **Note:** The Op only receives List of LoDTensor as input, only support SUM pooling now.
+
+    Args:
+        input(Variable|list of Variable): Input is List of LoDTensor.
+        pool_type(str): pooling type, only support SUM pooling now.
+        cvm(Variable): cvm Variable.
+        pad_value(float, optional): padding value of sequence pool. Default: 0.0.
+        use_cvm(bool, optional): use cvm or not. Default: True.
+        cvm_offset(int, optional): cvm offset. Default: 2, which means cvm contains show, click.
+
+    Returns:
+        Variable|list of Variable: The tensor variable storing sequence pool and cvm
+        of input.
+
+    Examples:
+        .. code-block:: python
+
+            import paddle
+            import paddle.fluid as fluid
+            paddle.enable_static()
+
+            data = paddle.static.data(name='x', shape=[-1, 1], dtype='int64', lod_level=1)
+            data2 = paddle.static.data(name='y', shape=[-1, 1], dtype='int64', lod_level=1)
+            inputs = [data, data2]
+            embs = fluid.layers.nn._pull_box_sparse(input=inputs, size=11, is_distributed=True, is_sparse=True)
+
+            label = paddle.static.data(name="label", shape=[-1, 1], dtype="int64", lod_level=1)
+            ones = fluid.layers.fill_constant_batch_size_like(input=label, shape=[-1, 1], dtype="int64", value=1)
+            show_clk = paddle.cast(paddle.concat([ones, label], axis=1), dtype='float32')
+            show_clk.stop_gradient = True
+
+            cvms = fluid.contrib.layers.fused_seqpool_cvm(embs, 'sum', show_clk)
+
+
+    """
+    helper = LayerHelper('weighted_random_sample', **locals())
+    check_variable_and_dtype(self_input, 'self_input', ['float32'],
+                            'weighted_random_sample')
+    check_variable_and_dtype(other_input, 'other_input', ['float32'],
+                            'weighted_random_sample')
+
+    dtype = helper.input_dtype(input_param_name='self_input')
+    self_input = helper.input("self_input")
+    other_input = helper.input("other_input")
+    feature_input = helper.input("feature_input")
+    label_input = helper.input("label_input")
+
+    out = helper.create_variable_for_type_inference(dtype)
+    random_rematch, rematch_flag = helper.create_or_get_global_variable(name="random_rematch", dtype='int64')
+    random_label_target, label_target_flag = helper.create_or_get_global_variable(name="random_label_target", dtype='int64')
+
+    helper.append_op(
+        type="weighted_random_sample",
+        inputs={"SelfInput": self_input,
+                "OtherInput": other_input,
+                "FeatureInput": feature_input,
+                "LabelInput": label_input},
+        outputs={"Out": out,
+                 "RandomRematch": random_rematch,
+                 "RandomLabelTarget": random_label_target},
+        attrs={
+            "vec_sim_max": vec_sim_max,
+            "vec_sim_base": vec_sim_base,
+            "fea_match_base": fea_match_base,
+            "random_rematch_ratio": random_rematch_ratio,
+            "do_random": do_random,
+            "use_global_random_rematch": use_global_random_rematch,
+            "weight_formula": weight_formula,
+            "need_initialize": need_initialize
+        })
+    random_rematch.stop_gradient=True
+    random_label_target.stop_gradient=True
+    return out, random_label_target
 
 def multiclass_nms2(bboxes,
                     scores,
@@ -901,7 +991,7 @@ def shuffle_batch(x, seed=None):
         seed = helper.create_variable(
             name=unique_name.generate("shuffle_batch_seed"),
             dtype="int64",
-            persistable=True)
+            persistable=False)
     helper.append_op(
         type='shuffle_batch',
         inputs={'X': x,

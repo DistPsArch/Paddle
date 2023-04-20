@@ -94,8 +94,7 @@ class DistributedAdam(DistributedOptimizerImplBase):
             ".batch_size@GRAD", ".batch_square_sum@GRAD", ".batch_sum@GRAD"
         ]
         self.supported_embedding_types = [
-            "lookup_table", "pull_sparse", "pull_sparse_v2", "pull_box_sparse",
-            "pull_gpups_sparse"
+            "lookup_table", "pull_sparse", "pull_sparse_v2", "pull_box_sparse", "pull_gpups_sparse"
         ]
         self.supported_embedding_grad_types = [
             "lookup_table_grad", "push_sparse", "push_sparse_v2"
@@ -339,8 +338,10 @@ class DistributedAdam(DistributedOptimizerImplBase):
         # set sparse_embedx_dim in the strategy according to accessor and use_cvm config
         if accessor == "DownpourFeatureValueAccessor" \
                 or accessor == "DownpourCtrAccessor" \
+                or accessor == "DownpourCtrDymfAccessor" \
                 or accessor == "DownpourDoubleUnitAccessor" \
-                or accessor == "DownpourUnitAccessor":
+                or accessor == "DownpourUnitAccessor" \
+                or accessor == 'DownpourCtrDoubleDymfAccessor':
             if st.get("sparse_embedx_dim") is not None \
                     and strategy.get("use_cvm") == True \
                     and st["sparse_embedx_dim"] != emb_to_size[table_name] - 3:
@@ -586,9 +587,11 @@ class DistributedAdam(DistributedOptimizerImplBase):
                 # set sparse_embedx_dim in strategy,
                 # user do not have to set it in config_fleet
                 if accessor == "DownpourFeatureValueAccessor" \
+                        or accessor == "DownpourCtrDymfAccessor" \
                         or accessor == "DownpourCtrAccessor" \
                         or accessor == "DownpourDoubleUnitAccessor" \
-                        or accessor == "DownpourUnitAccessor":
+                        or accessor == "DownpourUnitAccessor" \
+                        or accessor == 'DownpourCtrDoubleDymfAccessor':
                     if st.get("sparse_embedx_dim") is not None \
                             and st["sparse_embedx_dim"] != emb_to_size[key] - 3:
                         raise ValueError("fleet config sparse_embedx_dim=%s not"
@@ -873,7 +876,8 @@ class DistributedAdam(DistributedOptimizerImplBase):
         if server._server.downpour_server_param.downpour_table_param[
                 0].accessor.accessor_class in [
                     "DownpourCtrAccessor", "DownpourCtrDoubleAccessor",
-                    "DownpourUnitAccessor", "DownpourDoubleUnitAccessor"
+                    "DownpourUnitAccessor", "DownpourDoubleUnitAccessor", "DownpourCtrDymfAccessor", 
+                    "DownpourCtrDoubleDymfAccessor"
                 ]:
             opt_info["dump_slot"] = True
         elif server._server.downpour_server_param.downpour_table_param[

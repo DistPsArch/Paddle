@@ -13,6 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License. */
 
 #ifdef PADDLE_WITH_HETERPS
+#include "paddle/fluid/framework/heter_util.h"
 
 namespace paddle {
 namespace framework {
@@ -45,7 +46,8 @@ __global__ void insert_kernel(Table* table,
 template <typename Table>
 __global__ void insert_kernel(Table* table,
                               const typename Table::key_type* const keys,
-                              size_t len, char* pool, int start_index) {
+                              size_t len, char* pool, size_t feature_value_size,
+                              int start_index) {
   ReplaceOp<typename Table::mapped_type> op;
   thrust::pair<typename Table::key_type, typename Table::mapped_type> kv;
 
@@ -53,7 +55,8 @@ __global__ void insert_kernel(Table* table,
 
   if (i < len) {
     kv.first = keys[i];
-    kv.second = (Table::mapped_type)(pool + (start_index + i) * 80);
+    uint64_t offset = uint64_t(start_index + i) * feature_value_size;
+    kv.second = (Table::mapped_type)(pool + offset);
     auto it = table->insert(kv, op);
     assert(it != table->end() && "error: insert fails: table is full");
   }
@@ -69,51 +72,145 @@ __global__ void search_kernel(Table* table,
     auto it = table->find(keys[i]);
     if (it != table->end()) {
       vals[i] = it->second;
+    } else {
+      printf("pull miss key: %llu", keys[i]);
     }
   }
 }
 
-template <typename Table>
+template <class Table, typename GPUAccessor>
 __global__ void dy_mf_search_kernel(Table* table,
                                     const typename Table::key_type* const keys,
-                                    char* const vals, size_t len,
-                                    size_t pull_feature_value_size) {
+                                    char* vals,
+                                    size_t len,
+                                    size_t pull_feature_value_size,
+                                    GPUAccessor gpu_accessor) {
   const size_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < len) {
     auto it = table->find(keys[i]);
+    if (it != table->end()) {
+      uint64_t offset = i * pull_feature_value_size;
+      float* cur = (float*)(vals + offset);
+      float* input = it->second;
+      gpu_accessor.FeatureValueFill(cur, input);
+    } else {
+      if (keys[i] != 0) printf("pull miss key: %llu", keys[i]);
+    }
+  }
+}
 
-    if (it != table->end()) {
-      *(FeatureValue*)(vals + i * pull_feature_value_size) = *(it->second);
-    }
-  }
-}
-template <typename Table, typename GradType, typename Sgd>
-__global__ void update_kernel(Table* table,
-                              const typename Table::key_type* const keys,
-                              const GradType* const grads, size_t len,
-                              Sgd sgd) {
-  const size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+// optimized version
+template <>
+__global__ void dy_mf_search_kernel<TableContainer<FeatureKey, float*>, CommonFeatureValueAccessor>(TableContainer<FeatureKey, float*>* table,
+                                                                                                    const typename TableContainer<FeatureKey, float*>::key_type* const keys,
+                                                                                                    char* vals,
+                                                                                                    size_t len,
+                                                                                                    size_t pull_feature_value_size,
+                                                                                                    CommonFeatureValueAccessor gpu_accessor) {
+  const size_t i = blockIdx.x * blockDim.y + threadIdx.y;
+  const size_t k = threadIdx.x;
   if (i < len) {
     auto it = table->find(keys[i]);
     if (it != table->end()) {
-      sgd.update_value((it.getter())->second, grads[i]);
+      uint64_t offset = i * pull_feature_value_size;
+      float* cur = (float*)(vals + offset);
+      float* input = it->second;
+      gpu_accessor.FillDvals(cur, input, blockDim.x, k);
+    } else {
+      if (keys[i] != 0 && k == 0) printf("pull miss key: %llu",keys[i]);
+      if (keys[i] == 0 && k == 0) {
+        uint64_t offset = i * pull_feature_value_size;
+        float* cur = (float*)(vals + offset);
+        gpu_accessor.common_feature_value.MfDim(cur) = 0;
+      }
     }
   }
 }
+
+__global__ void  curand_init_kernel(curandState* p_value, int len) {
+  const size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < len) {
+    curand_init(clock64(), i, 0, p_value + i);
+  }
+}
+
+class CuRandState {
+public:
+  struct CallBackInfo {
+    std::shared_ptr<CuRandState>* obj;
+    int dev_id;
+  };
+  CuRandState() = default;
+  CuRandState(const CuRandState&) = delete;
+  CuRandState(CuRandState&&) = delete;
+  ~CuRandState() {
+    CHECK(cudaFree(states_) == cudaSuccess);
+  }
+  curandState* get(size_t size, gpuStream_t stream) {
+    if (size > size_) {
+      size_t new_size = size * 2;
+      curandState* new_state = nullptr;
+      CHECK(cudaMalloc(reinterpret_cast<void**>(&new_state), new_size * sizeof(curandState)) == cudaSuccess);
+      if (size_ > 0) {
+        CHECK(cudaMemcpyAsync(new_state, states_,
+                      size_ * sizeof(curandState), cudaMemcpyDeviceToDevice, stream) == cudaSuccess);
+      }
+      int init_len = new_size - size_;
+      const int BLOCK_SIZE_{256};
+      const int init_kernel_grid = (init_len - 1) / BLOCK_SIZE_ + 1;
+      curand_init_kernel<<<init_kernel_grid, BLOCK_SIZE_, 0, stream>>>(new_state + size_, init_len);
+      if (size_ != 0) {
+        CHECK(cudaStreamSynchronize(stream) == cudaSuccess);
+        CHECK(cudaFree(states_) == cudaSuccess);
+      }
+      states_ = new_state;
+      size_ = new_size;
+    }
+    return states_;
+  }
+
+  static HeterObjectPool<CuRandState>& pool(int dev_id) {
+    static HeterObjectPool<CuRandState> p[100];
+    return p[dev_id];
+  }
+
+  static std::shared_ptr<CuRandState> get(int dev_id) {
+    return pool(dev_id).Get();
+  }
+
+  static void CUDART_CB pushback_cu_rand_state(void* data) {
+    auto state = static_cast<CallBackInfo*>(data);
+    pool(state->dev_id).Push(std::move(*(state->obj)));
+    delete state->obj;
+    delete state;
+  }
+
+  static void push(std::shared_ptr<CuRandState> state, gpuStream_t stream, int dev_id) {
+    CallBackInfo* obj = new CallBackInfo();
+    obj->dev_id = dev_id;
+    obj->obj = new std::shared_ptr<CuRandState>(std::move(state));
+    CHECK(cudaLaunchHostFunc(stream, pushback_cu_rand_state,
+                             obj) == cudaSuccess);
+  }
+private:
+  size_t size_ = 0;
+  curandState* states_ = nullptr;
+};
 
 template <typename Table, typename Sgd>
 __global__ void dy_mf_update_kernel(Table* table,
+                                    const OptimizerConfig& optimizer_config,
                                     const typename Table::key_type* const keys,
-                                    const char* const grads, size_t len,
+                                    const char* const grads, curandState* p_state, size_t len,
                                     Sgd sgd, size_t grad_value_size) {
   const size_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < len) {
     auto it = table->find(keys[i]);
     if (it != table->end()) {
-      FeaturePushValue* cur = (FeaturePushValue*)(grads + i * grad_value_size);
-      sgd.dy_mf_update_value((it.getter())->second, *cur);
+      float* cur = (float*)(grads + i * grad_value_size);
+      sgd.dy_mf_update_value(optimizer_config, (it.getter())->second, cur, p_state[i]);
     } else {
-      printf("yxf::push miss key: %d", keys[i]);
+      if(keys[i] != 0) printf("push miss key: %llu", keys[i]);
     }
   }
 }
@@ -121,12 +218,18 @@ __global__ void dy_mf_update_kernel(Table* table,
 template <typename KeyType, typename ValType>
 HashTable<KeyType, ValType>::HashTable(size_t capacity) {
   container_ = new TableContainer<KeyType, ValType>(capacity);
+  cudaMalloc((void**)&device_optimizer_config_, sizeof(OptimizerConfig));
+  cudaMemcpy((void*)device_optimizer_config_,
+             &host_optimizer_config_,
+             sizeof(OptimizerConfig),
+             cudaMemcpyHostToDevice);
   rwlock_.reset(new phi::RWLock);
 }
 
 template <typename KeyType, typename ValType>
 HashTable<KeyType, ValType>::~HashTable() {
   delete container_;
+  cudaFree(device_optimizer_config_);
 }
 
 template <typename KeyType, typename ValType>
@@ -146,14 +249,19 @@ void HashTable<KeyType, ValType>::get(const KeyType* d_keys, ValType* d_vals,
 }
 
 template <typename KeyType, typename ValType>
+template <typename GPUAccessor>
 void HashTable<KeyType, ValType>::get(const KeyType* d_keys, char* d_vals,
-                                      size_t len, gpuStream_t stream) {
+                                      size_t len, gpuStream_t stream, GPUAccessor& gpu_accessor) {
   if (len == 0) {
     return;
   }
-  const int grid_size = (len - 1) / BLOCK_SIZE_ + 1;
-  dy_mf_search_kernel<<<grid_size, BLOCK_SIZE_, 0, stream>>>(
-      container_, d_keys, d_vals, len, pull_feature_value_size_);
+  
+  dim3 block_dims(32, 32);
+  const size_t grid_size = (len - 1) / 32 + 1;
+  dim3 grid_dims(grid_size);
+
+  dy_mf_search_kernel<<<grid_dims, block_dims, 0, stream>>>(
+      container_, d_keys, d_vals, len, pull_feature_value_size_, gpu_accessor);
 }
 
 template <typename KeyType, typename ValType>
@@ -170,7 +278,9 @@ void HashTable<KeyType, ValType>::insert(const KeyType* d_keys,
 
 template <typename KeyType, typename ValType>
 void HashTable<KeyType, ValType>::insert(const KeyType* d_keys, size_t len,
-                                         char* pool, size_t start_index,
+                                         char* pool,
+                                         size_t feature_value_size,
+                                         size_t start_index,
                                          gpuStream_t stream) {
   if (len == 0) {
     return;
@@ -180,11 +290,12 @@ void HashTable<KeyType, ValType>::insert(const KeyType* d_keys, size_t len,
     return;
   }
   insert_kernel<<<grid_size, BLOCK_SIZE_, 0, stream>>>(container_, d_keys, len,
-                                                       pool, start_index);
+                                                       pool, feature_value_size, start_index);
 }
 
 template <typename KeyType, typename ValType>
 void HashTable<KeyType, ValType>::dump_to_cpu(int devid, cudaStream_t stream) {
+/*
   container_->prefetch(cudaCpuDeviceId, stream);
   std::vector<std::thread> threads;
   size_t num = container_->size();
@@ -257,33 +368,58 @@ void HashTable<KeyType, ValType>::dump_to_cpu(int devid, cudaStream_t stream) {
   }
 
   // container_->prefetch(devid, stream);
+*/
 }
 
-template <typename KeyType, typename ValType>
-template <typename GradType, typename Sgd>
-void HashTable<KeyType, ValType>::update(const KeyType* d_keys,
-                                         const GradType* d_grads, size_t len,
-                                         Sgd sgd, gpuStream_t stream) {
-  if (len == 0) {
-    return;
-  }
-  const int grid_size = (len - 1) / BLOCK_SIZE_ + 1;
-  update_kernel<<<grid_size, BLOCK_SIZE_, 0, stream>>>(container_, d_keys,
-                                                       d_grads, len, sgd);
-}
+// template <typename KeyType, typename ValType>
+// template <typename GradType, typename Sgd>
+// void HashTable<KeyType, ValType>::update(const KeyType* d_keys,
+//                                         const GradType* d_grads, size_t len,
+//                                         Sgd sgd, gpuStream_t stream) {
+//  if (len == 0) {
+//    return;
+//  }
+//  auto state = CuRandState::get();
+//  auto d_state = state->get(len, stream);
+//  const int grid_size = (len - 1) / BLOCK_SIZE_ + 1;
+//  update_kernel<<<grid_size, BLOCK_SIZE_, 0, stream>>>(container_, *device_optimizer_config_, d_keys, d_grads, d_state, len, sgd);
+//  CuRandState::push(state, stream);
+// }
 
 template <typename KeyType, typename ValType>
 template <typename Sgd>
 void HashTable<KeyType, ValType>::update(const KeyType* d_keys,
                                          const char* d_grads, size_t len,
-                                         Sgd sgd, gpuStream_t stream) {
+                                         Sgd& sgd, gpuStream_t stream, int dev_id) {
   if (len == 0) {
     return;
   }
+  auto state = CuRandState::get(dev_id);
+  auto d_state = state->get(len, stream);
   const int grid_size = (len - 1) / BLOCK_SIZE_ + 1;
-
   dy_mf_update_kernel<<<grid_size, BLOCK_SIZE_, 0, stream>>>(
-      container_, d_keys, d_grads, len, sgd, push_grad_value_size_);
+      container_, *device_optimizer_config_, d_keys, d_grads, d_state, len, sgd, push_grad_value_size_);
+  CuRandState::push(state, stream, dev_id);
+}
+
+template <typename KeyType, typename ValType>
+void HashTable<KeyType, ValType>::set_sparse_sgd(
+    const OptimizerConfig& optimizer_config) {
+  host_optimizer_config_.set_sparse_sgd(optimizer_config);
+  cudaMemcpy((void*)device_optimizer_config_,
+             &host_optimizer_config_,
+             sizeof(OptimizerConfig),
+             cudaMemcpyHostToDevice);
+}
+
+template <typename KeyType, typename ValType>
+void HashTable<KeyType, ValType>::set_embedx_sgd(
+    const OptimizerConfig& optimizer_config) {
+  host_optimizer_config_.set_embedx_sgd(optimizer_config);
+  cudaMemcpy((void*)device_optimizer_config_,
+             &host_optimizer_config_,
+             sizeof(OptimizerConfig),
+             cudaMemcpyHostToDevice);
 }
 
 }  // end namespace framework

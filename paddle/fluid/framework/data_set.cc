@@ -121,6 +121,22 @@ void DatasetImpl<T>::SetDataFeedDesc(const std::string& data_feed_desc_str) {
 }
 
 template <typename T>
+std::vector<std::string> DatasetImpl<T>::GetSlots() {
+  auto multi_slot_desc = data_feed_desc_.multi_slot_desc();
+  use_slots_.clear();
+  for (int i = 0; i < multi_slot_desc.slots_size(); ++i) {
+    const auto& slot = multi_slot_desc.slots(i);
+    use_slots_.push_back(slot.name());
+  }
+  std::cout << "dataset use slots: ";
+  for (auto s : use_slots_) {
+    std::cout << s << " | ";
+  }
+  std::cout << " end " <<std::endl;
+  return use_slots_;
+}
+
+template <typename T>
 void DatasetImpl<T>::SetChannelNum(int channel_num) {
   channel_num_ = channel_num;
 }
@@ -173,6 +189,7 @@ template <typename T>
 void DatasetImpl<T>::SetFeaEval(bool fea_eval, int record_candidate_size) {
   slots_shuffle_fea_eval_ = fea_eval;
   slots_shuffle_rclist_.ReSize(record_candidate_size);
+  slots_record_shuffle_rclist_.ReSize(record_candidate_size);
   VLOG(3) << "SetFeaEval fea eval mode: " << fea_eval
           << " with record candidate size: " << record_candidate_size;
 }
@@ -416,6 +433,10 @@ void DatasetImpl<T>::LoadIntoMemory() {
   VLOG(3) << "DatasetImpl<T>::LoadIntoMemory() begin";
   platform::Timer timeline;
   timeline.Start();
+
+  // begin load into memory
+  readers_[0]->BeginLoadIntoMemory();
+
   std::vector<std::thread> load_threads;
   for (int64_t i = 0; i < thread_num_; ++i) {
     load_threads.push_back(std::thread(
@@ -424,6 +445,9 @@ void DatasetImpl<T>::LoadIntoMemory() {
   for (std::thread& t : load_threads) {
     t.join();
   }
+  // end load into memory
+  readers_[0]->EndLoadIntoMemory();
+   
   input_channel_->Close();
   int64_t in_chan_size = input_channel_->Size();
   input_channel_->SetBlockSize(in_chan_size / thread_num_ + 1);
@@ -1624,6 +1648,215 @@ void MultiSlotDataset::SlotsShuffle(
           << ", cost time=" << timeline.ElapsedSec() << " seconds";
 }
 
+void SlotRecordDataset::GetRandomData(
+    const std::unordered_set<uint16_t>& slots_to_replace,
+    std::vector<SlotRecord>* result) {
+  int debug_erase_cnt = 0;
+  int debug_push_cnt = 0;
+  auto multi_slot_desc = data_feed_desc_.multi_slot_desc();
+  slots_record_shuffle_rclist_.ReInit();
+  const auto& slots_shuffle_original_data = GetSlotsOriginalData();
+  // VLOG(0) << "Begin to get_random data";
+  for (const auto& rec : slots_shuffle_original_data) {
+    SlotRecordCandidate rand_rec;
+    SlotRecord new_rec = make_slotrecord();
+    *new_rec = *rec; 
+
+    slots_record_shuffle_rclist_.AddAndGet(rec, &rand_rec);
+    // VLOG(0) << "shuffle_done";
+    std::vector<uint64_t> slot_v;
+    // support multi slot shuffle one time;
+    for (auto it:slots_to_replace) {
+
+        int erase_begin =
+            new_rec->slot_uint64_feasigns_.slot_offsets.at(it);
+        int erase_end =
+            new_rec->slot_uint64_feasigns_.slot_offsets.at(it + 1);
+        auto slot_v_it = new_rec->slot_uint64_feasigns_.slot_values.begin()
+            + erase_begin;
+        for (int idx = erase_begin;
+             slot_v_it != new_rec->slot_uint64_feasigns_.slot_values.end() &&
+             idx < erase_end; ++idx) {
+             slot_v_it = 
+                 new_rec->slot_uint64_feasigns_.slot_values.erase(slot_v_it);
+             debug_erase_cnt += 1;
+        }
+        auto range = rand_rec.feas_.equal_range(it);
+        slot_v.clear();
+        for (auto it_val = range.first; it_val != range.second; ++it_val) {
+          slot_v.push_back(it_val->second);
+          debug_push_cnt += 1;
+        }
+
+        new_rec->slot_uint64_feasigns_.slot_values.insert(
+            new_rec->slot_uint64_feasigns_.slot_values.begin() + erase_begin,
+            slot_v.begin(),
+            slot_v.end());
+        // update slot_offset afterwards 
+        for (auto k = it + 1; k < static_cast<int>
+                (new_rec->slot_uint64_feasigns_.slot_offsets.size()); ++k) {
+            new_rec->slot_uint64_feasigns_.slot_offsets.at(k) =
+                new_rec->slot_uint64_feasigns_.slot_offsets.at(k)
+            - (erase_end - erase_begin) + slot_v.size();
+        }
+    }
+
+    result->push_back(std::move(new_rec));
+  }
+  VLOG(0) << "Result size:" << result->size();
+  VLOG(0) << "End to get_random data";
+  VLOG(2) << "erase feasign num: " << debug_erase_cnt
+          << " repush feasign num: " << debug_push_cnt;
+}
+
+void SlotRecordDataset::PreprocessChannel(
+    const std::set<std::string>& slots_to_replace,
+    std::unordered_set<uint16_t>& index_slots) {  // NOLINT
+  int out_channel_size = 0;
+  if (cur_channel_ == 0) {
+    for (size_t i = 0; i < multi_output_channel_.size(); ++i) {
+      out_channel_size += multi_output_channel_[i]->Size();
+    }
+  } else {
+    for (size_t i = 0; i < multi_consume_channel_.size(); ++i) {
+      out_channel_size += multi_consume_channel_[i]->Size();
+    }
+  }
+  VLOG(2) << "DatasetImpl<T>::SlotsShuffle() begin with input channel size: "
+          << input_channel_->Size()
+          << " output channel size: " << out_channel_size;
+
+  if ((!input_channel_ || input_channel_->Size() == 0) &&
+      slots_shuffle_original_data_.size() == 0 && out_channel_size == 0) {
+    VLOG(3) << "DatasetImpl<T>::SlotsShuffle() end, no data to slots shuffle";
+    return;
+  }
+
+  auto multi_slot_desc = data_feed_desc_.multi_slot_desc();
+  auto i_u = -1;
+  for (int i = 0; i < multi_slot_desc.slots_size(); ++i) {
+    std::string cur_slot_type = multi_slot_desc.slots(i).type();
+    std::string cur_slot = multi_slot_desc.slots(i).name();
+    if (cur_slot_type[0] == 'u') ++i_u;
+    if (cur_slot_type[0] == 'f' || (cur_slot[0] > 'a' && cur_slot[0] < 'z')) {
+        continue;
+    }
+    if (slots_to_replace.find(cur_slot) != slots_to_replace.end()) {
+      index_slots.insert(i_u);
+    }
+  }
+  CHECK(index_slots.size() > 0) << "the shuffle slot is out of dict!";
+  if (slots_shuffle_original_data_.size() == 0) {
+    // before first slots shuffle, instances could be in
+    // input_channel, oupput_channel or consume_channel
+    if (input_channel_ && input_channel_->Size() != 0) {
+      slots_shuffle_original_data_.reserve(input_channel_->Size());
+      input_channel_->Close();
+      input_channel_->ReadAll(slots_shuffle_original_data_);
+    } else {
+      CHECK(out_channel_size > 0);  // NOLINT
+      if (cur_channel_ == 0) {
+        for (size_t i = 0; i < multi_output_channel_.size(); ++i) {
+          std::vector<SlotRecord> vec_data;
+          multi_output_channel_[i]->Close();
+          multi_output_channel_[i]->ReadAll(vec_data);
+          slots_shuffle_original_data_.reserve(
+              slots_shuffle_original_data_.size() + vec_data.size());
+          slots_shuffle_original_data_.insert(
+              slots_shuffle_original_data_.end(),
+              std::make_move_iterator(vec_data.begin()),
+              std::make_move_iterator(vec_data.end()));
+          vec_data.clear();
+          vec_data.shrink_to_fit();
+          multi_output_channel_[i]->Clear();
+        }
+      } else {
+        for (size_t i = 0; i < multi_consume_channel_.size(); ++i) {
+          std::vector<SlotRecord> vec_data;
+          multi_consume_channel_[i]->Close();
+          multi_consume_channel_[i]->ReadAll(vec_data);
+          slots_shuffle_original_data_.reserve(
+              slots_shuffle_original_data_.size() + vec_data.size());
+          slots_shuffle_original_data_.insert(
+              slots_shuffle_original_data_.end(),
+              std::make_move_iterator(vec_data.begin()),
+              std::make_move_iterator(vec_data.end()));
+          vec_data.clear();
+          vec_data.shrink_to_fit();
+          multi_consume_channel_[i]->Clear();
+        }
+      }
+    }
+  } else {
+    // if already have original data for slots shuffle, clear channel
+    input_channel_->Clear();
+    if (cur_channel_ == 0) {
+      for (size_t i = 0; i < multi_output_channel_.size(); ++i) {
+        if (!multi_output_channel_[i]) {
+          continue;
+        }
+        multi_output_channel_[i]->Clear();
+      }
+    } else {
+      for (size_t i = 0; i < multi_consume_channel_.size(); ++i) {
+        if (!multi_consume_channel_[i]) {
+          continue;
+        }
+        multi_consume_channel_[i]->Clear();
+      }
+    }
+  }
+  int end_size = 0;
+  if (cur_channel_ == 0) {
+    for (size_t i = 0; i < multi_output_channel_.size(); ++i) {
+      if (!multi_output_channel_[i]) {
+        continue;
+      }
+      end_size += multi_output_channel_[i]->Size();
+    }
+  } else {
+    for (size_t i = 0; i < multi_consume_channel_.size(); ++i) {
+      if (!multi_consume_channel_[i]) {
+        continue;
+      }
+      end_size += multi_consume_channel_[i]->Size();
+    }
+  }
+  CHECK(input_channel_->Size() == 0)
+      << "input channel should be empty before slots shuffle";
+
+}
+
+// slots shuffle to input_channel_ with needed-shuffle slots
+void SlotRecordDataset::SlotsShuffle(
+    const std::set<std::string>& slots_to_replace) {
+  PADDLE_ENFORCE_EQ(slots_shuffle_fea_eval_,
+                    true,
+                    platform::errors::PreconditionNotMet(
+                        "fea eval mode off, need to set on for slots shuffle"));
+  platform::Timer timeline;
+  timeline.Start();
+  std::unordered_set<uint16_t> index_slots;
+  PreprocessChannel(slots_to_replace, index_slots);
+  // VLOG(0) << "Proprocess done";
+  std::vector<SlotRecord> random_data;
+  random_data.clear();
+  // get slots shuffled random_data
+  GetRandomData(index_slots, &random_data);
+  input_channel_->Open();
+  input_channel_->Write(std::move(random_data));
+  random_data.clear();
+  random_data.shrink_to_fit();
+  input_channel_->Close();
+  cur_channel_ = 0;
+
+  timeline.Pause();
+  VLOG(2) << "DatasetImpl<T>::SlotsShuffle() end"
+          << ", memory data size for slots shuffle=" << input_channel_->Size()
+          << ", cost time=" << timeline.ElapsedSec() << " seconds";
+}
+
+
 template class DatasetImpl<SlotRecord>;
 void SlotRecordDataset::CreateChannel() {
   if (input_channel_ == nullptr) {
@@ -1645,6 +1878,7 @@ void SlotRecordDataset::CreateReaders() {
     return;
   }
   VLOG(3) << "data feed class name: " << data_feed_desc_.name();
+
   for (int i = 0; i < thread_num_; ++i) {
     readers_.push_back(DataFeedFactory::CreateDataFeed(data_feed_desc_.name()));
     readers_[i]->Init(data_feed_desc_);
@@ -1720,22 +1954,222 @@ void SlotRecordDataset::DynamicAdjustChannelNum(int channel_num,
 
   VLOG(3) << "adjust channel num done";
 }
+// copied from abacus
+// Get time in seconds.
+inline double current_realtime() {
+    struct timespec tp;
+    clock_gettime(CLOCK_REALTIME, &tp);
+    return tp.tv_sec + tp.tv_nsec * 1e-9;
+}
+
+inline std::default_random_engine& local_random_engine() {
+    struct engine_wrapper_t {
+        std::default_random_engine engine;
+        engine_wrapper_t() {
+            static std::atomic<unsigned long> x(0);
+            std::seed_seq sseq = {x++, x++, x++, (unsigned long)(current_realtime() * 1000)};
+            engine.seed(sseq);
+        }
+    };
+    thread_local engine_wrapper_t r;
+    return r.engine;
+}
 
 void SlotRecordDataset::PrepareTrain() {
 #ifdef PADDLE_WITH_GLOO
   if (enable_heterps_) {
-    if (input_records_.size() == 0 && input_channel_ != nullptr &&
-        input_channel_->Size() != 0) {
-      input_channel_->ReadAll(input_records_);
-      VLOG(3) << "read from channel to records with records size: "
-              << input_records_.size();
+    if(slots_shuffle_fea_eval_) {
+        pre_input_records_.clear();
     }
-    VLOG(3) << "input records size: " << input_records_.size();
-    int64_t total_ins_num = input_records_.size();
-    std::vector<std::pair<int, int>> offset;
+    if (pre_input_records_.size() == 0 && input_channel_ != nullptr &&
+        input_channel_->Size() != 0) {
+      // channel shuffle 
+      input_channel_->ReadAll(pre_input_records_);
+      VLOG(3) << "read from channel to records with records size: "
+              << pre_input_records_.size();
+    }
+    VLOG(0) << "pre_input records size: " << pre_input_records_.size();
+
     int default_batch_size =
         reinterpret_cast<SlotRecordInMemoryDataFeed*>(readers_[0].get())
             ->GetDefaultBatchSize();
+
+    VLOG(0) << "default batch size: " << default_batch_size; 
+
+    // ============ multi-task adapter=================
+    // read from pre_input_records_ to input_records
+    
+    if (multi_task_num_ > 1 && pre_input_records_.size() > 0) { 
+
+        std::shuffle(pre_input_records_.begin(), pre_input_records_.end(), local_random_engine());
+    }
+
+    if (multi_task_num_ <=1 ) {
+      VLOG(0) << "multi_task_num = 1";
+      VLOG(0) << "input records size: " << input_records_.size();
+      // CHECK(input_records_.size() == 0) << "input_records size must be zero";
+      if (!pre_input_records_.empty()) {
+        VLOG(0) << "pre input records size: " << pre_input_records_.size();
+        // input_records_.insert(input_records_.end(), pre_input_records_.begin(), pre_input_records_.end());
+        input_records_ = std::move(pre_input_records_);
+        VLOG(0) << "input records size: " << input_records_.size();
+        pre_input_records_.clear();
+      }
+      VLOG(0) << "input records size: " << input_records_.size();
+    } else {
+ 
+        // 把每个task的样本分开
+        // std::vector<::paddle::framework::BlockingQueue<size_t>> task_recs(multi_task_num_, ::paddle::framework::BlockingQueue<size_t>());
+        std::vector<std::vector<size_t>> task_recs(multi_task_num_, std::vector<size_t>());
+        // 记录每个task的样本数量
+        // std::vector<size_t> task_recs_count(multi_task_num_, 0);
+
+        std::vector<std::shared_ptr<std::atomic<uint32_t>>> task_recs_count;
+        task_recs_count.resize(multi_task_num_);
+        for (size_t i = 0; i < task_recs_count.size(); i++) {
+          task_recs_count[i].reset(new std::atomic<uint32_t>());
+          task_recs_count[i]->store(0);
+        }
+
+         std::vector<int> task_id_vec(pre_input_records_.size(), 0);
+         int* task_id_data = task_id_vec.data();
+
+         std::vector<int> task_index_vec(pre_input_records_.size(), 0);
+         int* task_index_data = task_index_vec.data();
+         
+
+        // std::vector<std::pair<size_t, size_t>> minibatch_index;  // pair: queue, minibatch_index_in_queue
+
+        // minibatch building
+        // ============== multi-thread optimize ===============
+        const int pre_build_thread_num = 60;
+        std::vector<std::thread> build_threads;
+
+        auto prebuild_thread = [this, &task_recs_count, &task_id_data, &task_index_data, pre_build_thread_num](int thread_id) {
+          for (size_t i = thread_id; i < pre_input_records_.size(); i += pre_build_thread_num) {
+            // task id = 1, queue = 0
+            // task_id = 2, queue = 1
+            int task_id =
+                reinterpret_cast<SlotRecordInMemoryDataFeed*>(readers_[0].get())
+                    ->GetRecordTaskId(data_feed_desc_, pre_input_records_[i]);
+            size_t queue = (size_t)task_id - 1;
+            task_id_data[i] = queue;
+            CHECK(queue < (size_t)multi_task_num_);
+            // 样本id
+            // atomic operator 
+            // task_recs[queue].Push(i);
+            int task_index = task_recs_count[queue]->fetch_add(1);
+            task_index_data[i] = task_index;
+            // 该task获得一个完整minibatch数据，就将该minibatch加入候选队列
+            // 最后每个task剩余的不足minibatch的数据即抛弃
+            // 第二个参数是第几个minibatch
+            // if (ins_num % default_batch_size == 0) {
+            //    minibatch_index.push_back(std::make_pair(queue,
+            //            (size_t)(ins_num / default_batch_size - 1)));
+            //}
+          }
+        };
+        build_threads.resize(pre_build_thread_num);
+        for (int t = 0; t < pre_build_thread_num; t++) {
+          build_threads[t] = std::thread(prebuild_thread, t);
+        }
+        for(std::thread& t: build_threads) {
+          t.join();
+        }
+        build_threads.clear();
+
+        for(size_t i = 0; i < task_recs_count.size(); i++) {
+          task_recs[i].resize(task_recs_count[i]->load());
+        }
+
+        const size_t build_thread_num = 60;
+        auto build_thread = [this, &task_recs, &task_id_vec, &task_index_vec, build_thread_num](int thread_id) {
+          for (size_t i = thread_id; i < pre_input_records_.size(); i += build_thread_num) {
+             int queue = task_id_vec[i];
+             int index = task_index_vec[i];
+             task_recs[queue][index] = i;
+          }
+        };
+
+        build_threads.resize(build_thread_num);
+        for (size_t t = 0; t < build_thread_num; t++) {
+          build_threads[t] = std::thread(build_thread, t);
+        }
+        for(std::thread& t: build_threads) {
+          t.join();
+        }
+        build_threads.clear();
+
+        size_t minibatch_num = 0;
+        for (size_t i = 0; i < task_recs.size(); i++) {
+            minibatch_num += task_recs[i].size() / default_batch_size;
+        }
+
+        // ============== multi-thread optimize ===============
+        
+        if (!pre_input_records_.empty()) {
+ 
+          // std::shuffle(minibatch_index.begin(), minibatch_index.end(), local_random_engine());
+
+          // INFO LOG
+          VLOG(0) << "minibatch_size: " << default_batch_size;
+          VLOG(0) << "minibatch_index_size: " << minibatch_num;
+
+          input_records_.resize(minibatch_num * default_batch_size);
+
+          for (size_t i = 0; i < task_recs_count.size(); ++i) {
+            VLOG(0) << "task" << i + 1 << " recs count: " << task_recs_count[i]->load();
+          }
+
+          // ========== multi-thread optimize =========
+
+          const size_t move_thread_num = 30;
+          build_threads.resize(task_recs.size() * move_thread_num);
+       
+          auto move_thread = [this, &task_recs, default_batch_size, move_thread_num](size_t queue, size_t thread_id, size_t batch_offset) {
+            size_t minibatch_num = task_recs[queue].size() / default_batch_size;
+            for (size_t index = thread_id; index < minibatch_num; index += move_thread_num) {
+              for (size_t j = index * default_batch_size; j < (index + 1) * default_batch_size; ++j) {
+                input_records_[batch_offset * default_batch_size + j] = std::move(pre_input_records_[task_recs[queue][j]]);
+              }
+            }
+          };
+
+          size_t batch_offset = 0;
+          for (size_t i = 0; i < task_recs.size(); i++) { 
+            for (size_t j = 0; j < move_thread_num; j++) {
+              build_threads[i * move_thread_num + j] = std::thread(move_thread, i, j, batch_offset);
+            }
+            batch_offset += task_recs[i].size() / default_batch_size;
+          }
+          for(std::thread& t: build_threads) {
+            t.join();
+          }
+          build_threads.clear();
+
+          // minibatch concating
+          // 就是让一个minibatch的都是一个任务的
+          // for (size_t i = 0; i < minibatch_index.size(); ++i) {
+          //  size_t queue = minibatch_index[i].first;
+          //  size_t index = minibatch_index[i].second;
+          //  for (size_t j = index * default_batch_size; j < (index + 1) * default_batch_size; ++j) {
+          //      input_records_.push_back(std::move(pre_input_records_[task_recs[queue][j]]));
+          //  }
+          //}
+
+          // ============ multi-thread optimize =======
+          pre_input_records_.clear();
+        }    
+    }
+
+    VLOG(0) << "input records size: " << input_records_.size();
+
+    int64_t total_ins_num = input_records_.size();
+
+    // ============ multi-task adapter=================
+
+    std::vector<std::pair<int, int>> offset;
+
     VLOG(3) << "thread_num: " << thread_num_
             << " memory size: " << total_ins_num
             << " default batch_size: " << default_batch_size;
@@ -1771,6 +2205,23 @@ void SlotRecordDataset::DynamicAdjustReadersNum(int thread_num) {
   CreateReaders();
   VLOG(3) << "adjust readers num done";
   PrepareTrain();
+}
+
+std::vector<std::string> SlotRecordDataset::GetSlots() {
+  auto multi_slot_desc = data_feed_desc_.multi_slot_desc();
+  use_slots_.clear();
+  for (int i = 0; i < multi_slot_desc.slots_size(); ++i) {
+    const auto& slot = multi_slot_desc.slots(i);
+    if (slot.type() == "uint64" || slot.type() == "uint32") {
+      use_slots_.push_back(slot.name());
+    }
+  }
+  std::cout << "dataset use slots: ";
+  for (auto s : use_slots_) {
+    std::cout << s << " | ";
+  }
+  std::cout << " end " <<std::endl;
+  return use_slots_;
 }
 
 }  // end namespace framework

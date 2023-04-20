@@ -23,30 +23,37 @@ limitations under the License. */
 namespace paddle {
 namespace framework {
 
+template <typename GPUAccessor, template<typename T> class GPUOptimizer>
 class HeterPs : public HeterPsBase {
  public:
   HeterPs() {}
-  HeterPs(size_t capacity, std::shared_ptr<HeterPsResource> resource);
+  HeterPs(size_t capacity, std::shared_ptr<HeterPsResource> resource, GPUAccessor& gpu_accessor);
   virtual ~HeterPs();
   HeterPs(const HeterPs&) = delete;
   HeterPs& operator=(const HeterPs&) = delete;
 
-  virtual void pull_sparse(int num, FeatureKey* d_keys, FeatureValue* d_vals,
+  virtual void pull_sparse(int num, FeatureKey* d_keys, float* d_vals,
                            size_t len) override;
-  virtual void build_ps(int num, FeatureKey* h_keys, FeatureValue* h_vals,
-                        size_t len, size_t chunk_size, int stream_num) override;
+  // virtual void build_ps(int num, FeatureKey* h_keys, FeatureValue* h_vals,
+  //                      size_t len, size_t chunk_size, int stream_num) override;
+  virtual void build_ps(int num, FeatureKey* h_keys, char* pool,
+                        size_t len, size_t feature_value_size, size_t chunk_size, int stream_num) override;
   virtual void set_nccl_comm_and_size(
       const std::vector<ncclComm_t>& inner_comms,
       const std::vector<ncclComm_t>& inter_comms, int comm_size) override;
+  virtual void set_multi_mf_dim(int multi_mf_dim, int max_mf_dim) override;
   virtual void end_pass() override;
   virtual int get_index_by_devid(int devid) override;
   virtual void show_one_table(int gpu_num) override;
   virtual void push_sparse(int num, FeatureKey* d_keys,
-                           FeaturePushValue* d_grads, size_t len) override;
+                           float* d_grads, size_t len) override;
+
+  void set_sparse_sgd(const OptimizerConfig& optimizer_config) override;
+  void set_embedx_sgd(const OptimizerConfig& optimizer_config) override;
 
  private:
-  std::shared_ptr<HeterComm<FeatureKey, FeatureValue, FeaturePushValue>> comm_;
-  Optimizer<FeatureValue, FeaturePushValue> opt_;
+  std::shared_ptr<HeterComm<FeatureKey, float, float, GPUAccessor>> comm_;
+  GPUOptimizer<GPUAccessor> opt_;
 };
 
 }  // end namespace framework

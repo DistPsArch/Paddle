@@ -31,6 +31,7 @@ limitations under the License. */
 #include "paddle/fluid/framework/fleet/heter_ps/mem_pool.h"
 #ifdef PADDLE_WITH_HETERPS
 #include "paddle/fluid/platform/device/gpu/gpu_types.h"
+#include "paddle/fluid/framework/fleet/heter_ps/optimizer.cuh.h"
 
 namespace paddle {
 namespace framework {
@@ -55,21 +56,24 @@ class HashTable {
   HashTable& operator=(const HashTable&) = delete;
   void insert(const KeyType* d_keys, const ValType* d_vals, size_t len,
               gpuStream_t stream);
-  void insert(const KeyType* d_keys, size_t len, char* pool, size_t start_index,
-              gpuStream_t stream);
+  void insert(const KeyType* d_keys, size_t len, char* pool, size_t feature_value_size,
+              size_t start_index, gpuStream_t stream);
   void get(const KeyType* d_keys, ValType* d_vals, size_t len,
            gpuStream_t stream);
-  void get(const KeyType* d_keys, char* d_vals, size_t len, gpuStream_t stream);
+
+  template <typename GPUAccessor>
+  void get(const KeyType* d_keys, char* d_vals, size_t len, gpuStream_t stream, GPUAccessor& gpu_accessor);
+
   void show();
   void dump_to_cpu(int devid, cudaStream_t stream);
 
-  template <typename GradType, typename Sgd>
-  void update(const KeyType* d_keys, const GradType* d_grads, size_t len,
-              Sgd sgd, gpuStream_t stream);
+  //template <typename GradType, typename Sgd>
+  //void update(const KeyType* d_keys, const GradType* d_grads, size_t len,
+  //            Sgd sgd, gpuStream_t stream);
 
   template <typename Sgd>
-  void update(const KeyType* d_keys, const char* d_grads, size_t len, Sgd sgd,
-              gpuStream_t stream);
+  void update(const KeyType* d_keys, const char* d_grads, size_t len, Sgd& sgd,
+              gpuStream_t stream, int dev_id);
 
   int size() { return container_->size(); }
 
@@ -81,6 +85,9 @@ class HashTable {
             << " push value size: " << push_grad_value_size_;
   }
 
+  void set_sparse_sgd(const OptimizerConfig& optimizer_config);
+  void set_embedx_sgd(const OptimizerConfig& optimizer_config);
+
   std::unique_ptr<phi::RWLock> rwlock_{nullptr};
 
  private:
@@ -91,6 +98,8 @@ class HashTable {
   size_t max_mf_dim_ = 8;
   size_t pull_feature_value_size_;
   size_t push_grad_value_size_;
+  OptimizerConfig* device_optimizer_config_;
+  OptimizerConfig host_optimizer_config_;
 };
 }  // end namespace framework
 }  // end namespace paddle

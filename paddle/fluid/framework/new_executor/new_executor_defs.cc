@@ -322,6 +322,10 @@ bool InterpretercoreInferShapeContext::IsRunMKLDNNKernel() const {
   }
 }
 
+Scope* InterpretercoreInferShapeContext::GetScopePtr() const {
+  return nullptr;
+}
+
 // TODO(paddle-dev): Can this be template?
 std::vector<InferShapeVarPtr> InterpretercoreInferShapeContext::GetInputVarPtrs(
     const std::string& name) const {

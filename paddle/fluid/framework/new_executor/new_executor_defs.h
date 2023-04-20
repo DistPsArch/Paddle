@@ -88,6 +88,8 @@ class InterpretercoreInferShapeContext : public InferShapeContext {
 
   bool IsRunMKLDNNKernel() const override;
 
+  Scope* GetScopePtr() const override;
+
   // TODO(paddle-dev): Can this be template?
   std::vector<InferShapeVarPtr> GetInputVarPtrs(
       const std::string& name) const override;
