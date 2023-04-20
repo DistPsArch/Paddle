@@ -374,48 +374,41 @@ __host__ void BuildFill(float* gpu_val,
   auto* cpu_accessor = dynamic_cast<::paddle::ps::DownpourCtrDymfTplAccessor<ShowClickType>*>(_cpu_accessor);
   auto* cpu_val = reinterpret_cast<::paddle::ps::DownpourFixedFeatureValue*>(_cpu_val);
   float* ptr_val = cpu_val->data();
-  size_t cpu_dim = cpu_val->size();
+  size_t cpu_dim_byte = cpu_val->size_byte();
 
   gpu_val[common_feature_value.DeltaScoreIndex()] =
       ptr_val[cpu_accessor->get_delta_score_index()];
   gpu_val[common_feature_value.ShowIndex()] = cpu_accessor->get_show(ptr_val);
   gpu_val[common_feature_value.ClickIndex()] = cpu_accessor->get_click(ptr_val);
 
-  gpu_val[common_feature_value.SlotIndex()] = 
-      ptr_val[cpu_accessor->get_slot_index()];
+  cpu_accessor->get_slot((uint8_t*)ptr_val, gpu_val + common_feature_value.SlotIndex());
 
   // lr
-  gpu_val[common_feature_value.EmbedWIndex()] = 
-      ptr_val[cpu_accessor->get_embed_w_index()];
+  cpu_accessor->get_embed_w((uint8_t*)ptr_val, gpu_val + common_feature_value.EmbedWIndex());
 
   // cpu_ptr
   *(reinterpret_cast<uint64_t*>(gpu_val + common_feature_value.CpuPtrIndex())) = (uint64_t)(cpu_val);
 
   // lr_g2sum
   // for dymf && adagrad, embed_dim = 1
-  for (int i = 0; i < common_feature_value.EmbedDim(); i++) {
-    gpu_val[common_feature_value.EmbedG2SumIndex() + i] =
-      ptr_val[cpu_accessor->get_embed_g2sum_index() + i];
-  }
+  cpu_accessor->get_embed_g2sum((uint8_t*)ptr_val, gpu_val + common_feature_value.EmbedG2SumIndex(),
+                                  common_feature_value.EmbedDim());
 
-  ptr_val[cpu_accessor->get_mf_dim_index()] = float(mf_dim);
+  //ptr_val[cpu_accessor->get_mf_dim_index()] = float(mf_dim);
   gpu_val[common_feature_value.MfDimIndex()] = float(mf_dim);
-  constexpr int n = 2 * (sizeof(ShowClickType) / sizeof(float) - 1);
 
-  if (cpu_dim > 8 + n) {
+  if (int(cpu_dim_byte) > int(cpu_accessor->get_mf_start_index())) {
     gpu_val[common_feature_value.MfSizeIndex()] = 
         common_feature_value.MFSize(mf_dim) / sizeof(float);
-
-    for (int x = 0; x < int(common_feature_value.MFSize(mf_dim) / sizeof(float));
-            x++) {
-      gpu_val[common_feature_value.EmbedxG2SumIndex() + x]  = ptr_val[8 + n + x];
-    }
+    cpu_accessor->get_mf_embedx((uint8_t*)ptr_val, gpu_val + common_feature_value.EmbedxG2SumIndex(),
+                                  int(common_feature_value.MFSize(mf_dim) / sizeof(float)));
   } else {
     gpu_val[common_feature_value.MfSizeIndex()] = 0;
     for (int i = 0; i < mf_dim + common_feature_value.EmbedXDim(); i++) {
       gpu_val[common_feature_value.EmbedxG2SumIndex() + i] = 0;
     }
   }
+
 #endif
 }
 
@@ -430,13 +423,16 @@ __host__ void DumpFill(float* gpu_val,
   auto* cpu_accessor = dynamic_cast<::paddle::ps::DownpourCtrDymfTplAccessor<ShowClickType>*>(_cpu_accessor);
   uint64_t cpu_addr = *(uint64_t*)(gpu_val + common_feature_value.CpuPtrIndex());
   auto* downpour_value = (::paddle::ps::DownpourFixedFeatureValue*)cpu_addr;
-  int downpour_value_size = downpour_value->size();
-  constexpr int n = 2 * (sizeof(ShowClickType) / sizeof(float) - 1);
-  if ((int)gpu_val[common_feature_value.MfSizeIndex()] > 0 && downpour_value_size == 8 + n) {
+  int downpour_value_size = downpour_value->size_byte();
+  if ((int)gpu_val[common_feature_value.MfSizeIndex()] > 0 && downpour_value_size == cpu_accessor->get_init_byte_size()) {
     int mf_size = common_feature_value.MFSize(mf_dim) / sizeof(float); // mf_size = gpu_val[common_feature_value.MfSizeIndex()];
-    downpour_value->resize(downpour_value_size + mf_size);
+    if (!cpu_accessor->need_quantize()) {
+        downpour_value->resize_byte(downpour_value_size + mf_size * sizeof(float));
+    } else {
+        downpour_value->resize_byte(downpour_value_size + mf_size * sizeof(uint16_t));
+    }
   }
-  float* cpu_val = downpour_value->data(); 
+  float* cpu_val = downpour_value->data();
 
   cpu_val[cpu_accessor->get_delta_score_index()] =
       gpu_val[common_feature_value.DeltaScoreIndex()];
@@ -444,23 +440,15 @@ __host__ void DumpFill(float* gpu_val,
       (ShowClickType)gpu_val[common_feature_value.ShowIndex()];
   *(ShowClickType*)(cpu_val + cpu_accessor->get_click_index()) =
       (ShowClickType)gpu_val[common_feature_value.ClickIndex()];
-  cpu_val[cpu_accessor->get_embed_w_index()] =
-      gpu_val[common_feature_value.EmbedWIndex()];
-  cpu_val[cpu_accessor->get_slot_index()] =
-      gpu_val[common_feature_value.SlotIndex()];
+  cpu_accessor->set_embed_w(gpu_val + common_feature_value.EmbedWIndex(), (uint8_t *)cpu_val);
+  cpu_accessor->set_slot(gpu_val + common_feature_value.SlotIndex(), (uint8_t *)cpu_val);
 
   // for dymf && adagrad, embed_dim = 1
-  for (int i = 0; i < common_feature_value.EmbedDim(); i++) {
-    cpu_val[cpu_accessor->get_embed_g2sum_index() + i] =
-      gpu_val[common_feature_value.EmbedG2SumIndex() + i];
-  }
-  
+  cpu_accessor->set_embed_g2sum(gpu_val + common_feature_value.EmbedG2SumIndex(), (uint8_t *)cpu_val,
+                                  common_feature_value.EmbedDim());
   if ((int)gpu_val[common_feature_value.MfSizeIndex()] > 0) {
-    for (int x = 0; x < int(common_feature_value.MFSize(mf_dim) / sizeof(float));
-              x++) {
-        cpu_val[x + 8 + n] =
-          gpu_val[common_feature_value.EmbedxG2SumIndex() + x];
-    }
+    cpu_accessor->set_mf_embedx(gpu_val + common_feature_value.EmbedxG2SumIndex(), (uint8_t *)cpu_val,
+                            int(common_feature_value.MFSize(mf_dim) / sizeof(float)));
   }
 #endif
 }
