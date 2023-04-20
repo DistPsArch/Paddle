@@ -88,7 +88,7 @@ class DownpourServer(Server):
                                    'embed_sparse_initial_range', 'embed_sparse_initial_g2sum', 'embed_sparse_beta1_decay_rate', \
                                    'embed_sparse_beta2_decay_rate', 'embedx_sparse_optimizer', 'embedx_sparse_learning_rate', \
                                    'embedx_sparse_weight_bounds', 'embedx_sparse_initial_range', 'embedx_sparse_initial_g2sum', \
-                                   'embedx_sparse_beta1_decay_rate', 'embedx_sparse_beta2_decay_rate']
+                                   'embedx_sparse_beta1_decay_rate', 'embedx_sparse_beta2_decay_rate', 'sparse_quantize_type']
 
         for key in strategy:
             if key not in support_sparse_key_list:
@@ -435,6 +435,7 @@ class DownpourServer(Server):
         table.accessor.embedx_dim = strategy.get('sparse_embedx_dim', 8)
         table.accessor.embedx_threshold = strategy.get(
             'sparse_embedx_threshold', 10)
+        table.accessor.quantize_type = strategy.get('sparse_quantize_type', 0)
         table.accessor.fea_dim = int(table.accessor.embedx_dim) + 3
         table.accessor.downpour_accessor_param.nonclk_coeff = strategy.get(
             'sparse_nonclk_coeff', 0.1)
