@@ -375,6 +375,32 @@ void PSGPUWorker::TrainFiles() {
   platform::Timer timeline;
   timeline.Start();
 
+  // profile
+  std::vector<double> op_total_time;
+  std::vector<std::string> op_name;
+
+  for (auto& op : ops_) {
+    bool need_skip = false;
+    for (auto t = 0u; t < skip_ops_.size(); ++t) {
+      if (op->Type().find(skip_ops_[t]) != std::string::npos) {
+        need_skip = true;
+        break;
+      }
+    }
+    if (!need_skip) {
+      op_name.push_back(op->Type());
+    }
+  }
+
+  VLOG(3) << "op name size: " << op_name.size();
+  op_total_time.resize(op_name.size());
+  for (size_t i = 0; i < op_total_time.size(); ++i) {
+    op_total_time[i] = 0.0;
+  }
+  double total_time = 0.0;
+  double read_time = 0.0;
+  // profile
+
   int total_ins_num = 0;
 
   // how to accumulate fetched values here
@@ -471,6 +497,15 @@ void PSGPUWorker::TrainFiles() {
     if (cur_batch <= 0) {
       break;
     }
+    // VLOG(0) << "gpu:" << thread_id_ << ", bs:" << cur_batch; 
+    // profile 
+    timeline.Pause();
+    read_time += timeline.ElapsedSec();
+    total_time += timeline.ElapsedSec();
+    int run_op_idx = 0;
+    dev_ctx_->Wait();
+    // profile
+
     device_reader_->SetCurBatchSize(cur_batch);
     total_ins_num += cur_batch;
 
@@ -495,12 +530,40 @@ void PSGPUWorker::TrainFiles() {
           }
         }
         if (!need_skip) {
+          timeline.Start();
+          VLOG(3) << "Going to run op " << op_name[run_op_idx];
           OpRunAndShapeCheck(*op, *thread_scope, place_);
+          dev_ctx_->Wait();
+          VLOG(3) << "Op " << op_name[run_op_idx] << " Finished";
+          timeline.Pause();
+          op_total_time[run_op_idx++] += timeline.ElapsedSec();
+          total_time += timeline.ElapsedSec();
+          
         }
       }
       graph_batch_size = cur_batch;
       PrepareCudaGraph();
+      // profile
+      /*
+      if (op_or_cudagraphs_.empty()) VLOG(0) << "cudagraph is empty!!!";
+      else {
+          VLOG(0) << "cudagraph is not empty!!!";
+          for (auto& op_or_cuda_graph : op_or_cudagraphs_) {
+              if (op_or_cuda_graph.need_capture) {
+                  for (auto& op: op_or_cuda_graph.ops) {
+                      VLOG(0) << "op:" << op->Type() << " is captured";
+                  }
+              } else {
+                  for (auto& op: op_or_cuda_graph.ops) {
+                      VLOG(0) << "op:" << op->Type() << " is not captured";
+                  }
+              }
+          }
+      }
+      */
+      // profile
     } else if (graph_batch_size != cur_batch || batch_cnt <= thread_id_) {
+      VLOG(0) << "[zmx debug] thread_id:" << thread_id_ << " batch_size changed, cur:" << cur_batch << ", prev:" << graph_batch_size;
       // when batch_size changed, run original ops
       for (auto& op : ops_) {
         bool need_skip = false;
@@ -511,7 +574,14 @@ void PSGPUWorker::TrainFiles() {
           }
         }
         if (!need_skip) {
+          timeline.Start();
+          VLOG(3) << "Going to run op " << op_name[run_op_idx];
           OpRunAndShapeCheck(*op, *thread_scope, place_);
+          dev_ctx_->Wait();
+          VLOG(3) << "Op " << op_name[run_op_idx] << " Finished";
+          timeline.Pause();
+          op_total_time[run_op_idx++] += timeline.ElapsedSec();
+          total_time += timeline.ElapsedSec();
         }
       }
     } else {
@@ -532,7 +602,14 @@ void PSGPUWorker::TrainFiles() {
           op_or_cuda_graph.cudagraph->Replay();
         } else {
           for (auto& op : op_or_cuda_graph.ops) {
+            timeline.Start();
+            VLOG(3) << "Going to run op " << op_name[run_op_idx];
             OpRunAndShapeCheck(*op, *thread_scope, place_);
+            dev_ctx_->Wait();
+            VLOG(3) << "Op " << op_name[run_op_idx] << " Finished";
+            timeline.Pause();
+            op_total_time[run_op_idx++] += timeline.ElapsedSec();
+            total_time += timeline.ElapsedSec();
           }
         }
       }
@@ -579,12 +656,15 @@ void PSGPUWorker::TrainFiles() {
         exit(-1);
       }
     }
-
-    dev_ctx_->Wait();
+    timeline.Start();
+    // dev_ctx_->Wait();
     PrintFetchVars();
     thread_scope->DropKids();
+    dev_ctx_->Wait();
+    timeline.Pause();
+    total_time += timeline.ElapsedSec();
     ++batch_cnt;
-
+    
     if (scope_num_ != 1) {
       std::vector<Variable*>& cur_scope_vars = need_reuse_var_vec_[thread_scope];
       PADDLE_ENFORCE_EQ(cur_scope_vars.size(), need_reuse_var_.size(),
@@ -600,13 +680,23 @@ void PSGPUWorker::TrainFiles() {
       device_reader_->get_pack(cur_task.pack);
       free_task_queue_.Push(cur_task);
     }
+    timeline.Start();
   }
   if (need_dump_field_ || need_dump_param_) {
     writer_.Flush();
   }
   timeline.Pause();
-  VLOG(0) << "GpuPs worker " << thread_id_ << " train cost "
-          << timeline.ElapsedSec() << " seconds, ins_num: " << total_ins_num;
+  // VLOG(0) << "GpuPs worker " << thread_id_ << " train cost "
+  //         << timeline.ElapsedSec() << " seconds, ins_num: " << total_ins_num;
+  VLOG(0) << "GpuPs worker " << thread_id_ << " train cost " << total_time
+          << " seconds, ins_num: " << total_ins_num << " batch_cnt:" << batch_cnt;
+  for (size_t i = 0; i < op_name.size(); ++i) {
+    VLOG(0) << "card:" << thread_id_ << ", i:" << i << ", op: " << op_name[i]
+            << ", mean time: " << op_total_time[i] / total_ins_num
+            << "s, totol time:" << op_total_time[i] << "sec";
+  }
+  VLOG(0) << "card: " << thread_id_ << " read time: " << read_time
+          << ", percent: " << read_time / total_time * 100;
   return;
 }
 
