@@ -364,17 +364,20 @@ void HeterComm<KeyType, ValType, GradType, GPUAccessor>::create_storage(
   auto& nodes = path_[start_index][end_index].nodes_;
   for (size_t i = 0; i < nodes.size(); ++i) {
     platform::CUDADeviceGuard guard(resource_->dev_id(nodes[i].gpu_num));
-    PADDLE_ENFORCE_GPU_SUCCESS(allocator->DeviceAllocate(
-        resource_->dev_id(nodes[i].gpu_num),
-        (void**)&(nodes[i].key_storage),  // NOLINT
-        keylen, resource_->remote_stream(nodes[i].gpu_num, start_index)));
-    PADDLE_ENFORCE_GPU_SUCCESS(allocator->DeviceAllocate(
-        resource_->dev_id(nodes[i].gpu_num),
-        (void**)&(nodes[i].val_storage),  // NOLINT
-        vallen, resource_->remote_stream(nodes[i].gpu_num, start_index)));
-
-    nodes[i].key_bytes_len = keylen;
-    nodes[i].val_bytes_len = vallen;
+    if (keylen > 0) {
+      PADDLE_ENFORCE_GPU_SUCCESS(allocator->DeviceAllocate(
+          resource_->dev_id(nodes[i].gpu_num),
+          (void**)&(nodes[i].key_storage),  // NOLINT
+          keylen, resource_->remote_stream(nodes[i].gpu_num, start_index)));
+      nodes[i].key_bytes_len = keylen;
+    }
+    if (vallen > 0) {
+      PADDLE_ENFORCE_GPU_SUCCESS(allocator->DeviceAllocate(
+          resource_->dev_id(nodes[i].gpu_num),
+          (void**)&(nodes[i].val_storage),  // NOLINT
+          vallen, resource_->remote_stream(nodes[i].gpu_num, start_index)));
+      nodes[i].val_bytes_len = vallen;
+    }
   }
 }
 
@@ -386,11 +389,18 @@ void HeterComm<KeyType, ValType, GradType, GPUAccessor>::destroy_storage(
   auto& nodes = path_[start_index][end_index].nodes_;
   for (size_t i = 0; i < nodes.size(); ++i) {
     platform::CUDADeviceGuard guard(resource_->dev_id(nodes[i].gpu_num));
-
-    PADDLE_ENFORCE_GPU_SUCCESS(allocator->DeviceFree(
-        resource_->dev_id(nodes[i].gpu_num), nodes[i].key_storage));
-    PADDLE_ENFORCE_GPU_SUCCESS(allocator->DeviceFree(
-        resource_->dev_id(nodes[i].gpu_num), nodes[i].val_storage));
+    if (nodes[i].key_storage) {
+      PADDLE_ENFORCE_GPU_SUCCESS(allocator->DeviceFree(
+          resource_->dev_id(nodes[i].gpu_num), nodes[i].key_storage));
+      nodes[i].key_storage = nullptr;
+      nodes[i].key_bytes_len = 0;
+    }
+    if (nodes[i].val_storage) {
+      PADDLE_ENFORCE_GPU_SUCCESS(allocator->DeviceFree(
+          resource_->dev_id(nodes[i].gpu_num), nodes[i].val_storage));
+      nodes[i].val_storage = nullptr;
+      nodes[i].val_bytes_len = 0;
+    }
   }
 }
 
