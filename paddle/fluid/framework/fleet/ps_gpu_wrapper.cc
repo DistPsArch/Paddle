@@ -924,7 +924,7 @@ void PSGPUWrapper::start_build_thread() {
   running_ = true;
   VLOG(3) << "start build CPU ps thread.";
   pre_build_threads_ = std::thread([this] { pre_build_thread(); });
-  buildpull_threads_ = std::thread([this] { build_pull_thread(); });
+  // buildpull_threads_ = std::thread([this] { build_pull_thread(); });
 }
 
 void PSGPUWrapper::pre_build_thread() {
@@ -946,7 +946,7 @@ void PSGPUWrapper::pre_build_thread() {
   }
   VLOG(3) << "build cpu thread end";
 }
-
+/*
 void PSGPUWrapper::build_pull_thread() {
   while (running_) {
     std::shared_ptr<HeterContext> gpu_task = nullptr;
@@ -964,6 +964,7 @@ void PSGPUWrapper::build_pull_thread() {
   }
   VLOG(3) << "build cpu thread end";
 }
+*/
 
 void PSGPUWrapper::build_task() {
   // build_task: build_pull + build_gputask
@@ -973,14 +974,14 @@ void PSGPUWrapper::build_task() {
     return;
   }
   // ins and pre_build end
-  if (!buildpull_ready_channel_->Get(gpu_task)) {
+  if (!buildcpu_ready_channel_->Get(gpu_task)) {
     return;
   }
 
   VLOG(0) << "BuildPull start.";
   platform::Timer timer;
   timer.Start();
-//  BuildPull(gpu_task);
+  BuildPull(gpu_task);
   BuildGPUTask(gpu_task);
   timer.Pause();
   VLOG(0) << " BuildGPUTask end, cost time: " << timer.ElapsedSec()
